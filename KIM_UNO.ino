@@ -28,11 +28,6 @@
 uint16_t DEBUG_DELAY = 0;
 boolean IO_DEBUG = false;
 
-byte keyCode[] = {  0,  
-                    1, 22,  7,  6,  5,  4,  3,  2, 
-                    8, 23, 14, 13, 12, 11, 10,  9,
-                   15, 24, 19, 21, 20, 18, 17, 16 };
-
 ///////
 // Meta-registers
 ///////
@@ -133,13 +128,11 @@ uint8_t irqSource;  // Originator of the IRQ -- available via EMT #2
 uint8_t U24_74145[] = {9, 10, 11, 255, 12, 13, A0, A1, A2, A3, 255, 255, 255, 255, 255, 255};  
 
 ///////
-// KIM hardware switch and hardware buttons
+// KIM-1 SST switch state
 ///////
 
 boolean kimSST = false;
-//boolean kST    = false;
-//boolean kRS    = false;
-boolean kSST   = false;
+boolean kimTTY = false;
 
 ///////
 // Memory 
@@ -203,17 +196,14 @@ uint8_t auxRAM[auxRAMsize];
 
 uint16_t const ROMsize = 2048;
 uint16_t const ROMstart = 0x1800;
-const unsigned char memROM[ROMsize] PROGMEM = {
 #include "KIM_1_ROM.h"
-};
 
 #include "OP_TABLES.h"
 #include "PROGS.h"
 
-
-/////////////////////
-// Basic utilities //
-/////////////////////
+////////////////////////////////
+// Debugging utility functions//
+////////////////////////////////
 
 char hexDigits[] = "0123456789ABCDEF";
 
@@ -240,6 +230,7 @@ void pb8(uint8_t theValue, char* LoHi) {
         Serial.print((char) LoHi[((theValue >> ix) & 0x01)]);
     }
 }
+
 ///////////////////////
 // Internal routines //
 ///////////////////////
@@ -259,10 +250,9 @@ static void incrementClock(void) {
 }   
     
 
-/**
- * ALL memory accesses happen via the following two functions.
- */
-
+/** IMPORTANT! *************************************************
+ * ALL memory accesses happen via the following two functions. *
+ ***************************************************************/
 
 /**
  *  Notes regarding 6530 I/O and Timer area:
@@ -337,7 +327,7 @@ static void memoryFetch(void) {
     uint8_t riotSelect = 0, portSelect = 0, registerSelect = 0;
 	uint8_t portb, portc, portd;
 
-    regMAR &= 0x1fff;                   /** KIM-1 does not decode the 3 MSBs of the address bus **/
+    regMAR &= 0x1fff;        /** KIM-1 does not decode the 3 MSBs of the address bus **/
 	
     if (regMAR < RAMsize)
         regMDR = memRAM[regMAR];
@@ -376,26 +366,16 @@ static void memoryFetch(void) {
 				    regMDR = (portd >> 2) & 0x3f;
                     regMDR |= (portb & bit0) << 6;
                     regMDR |= bit7;
+
+                    // Special case: if row 3 is selected, KIM is testing for TTY jumper
+                    if (((riot_Data[PBD] & 0x1E) == 0x06) && kimTTY) regMDR &= ~bit0;
+                    
                     if (IO_DEBUG) {
                         Serial.print(F("RRR KIM: PortA ")); pb8(regMDR, "-*");
                         Serial.print(F("   AVR: PortB ")); pb8(portb, "-*");
                         Serial.print(F("  PortC ")); pb8(portc, "-*");
                         Serial.print(F("  PortD ")); pb8(portd, "-*");
                         Serial.println("");
-                    }
-                    if ((portc & bit5) == 0) {                         // if phantom column is high
-                        while ((portc & bit5) == 0) { portc = PINC; };
-                        switch ((riot_Data[PBD] >> 1) & 0x0f) {  
-                            /* case 0:                  // set appropriate phantom key
-                                kST = true;
-                                break;
-                            case 1:
-                                kRS = true;
-                                break; */
-                            case 2:
-                                kSST = true;
-                                break;
-                        }
                     }
 				} else {                              // KIM Port B
 					if      (portb & bit1) regMDR = 0b11100011;
@@ -464,7 +444,7 @@ static void memoryStore(void) {
                         portc = PINC | bit5;
                         portb = (PINB | 0x01) ^ ((regMDR & bit6) >> 6);
 
-                        if (kimSST & digitalRead(A3)) portc &= ~bit5;  // DP in dig 6 says SST on
+                        if (kimSST && digitalRead(A3)) portc &= ~bit5;  // DP in dig 6 says SST on
 						
                         PORTD = portd;
                         PORTC = portc;
@@ -476,7 +456,6 @@ static void memoryStore(void) {
                             Serial.print(F("  PortC ")); pb8(portc, "-*");
                             Serial.print(F("  PortD ")); pb8(portd, "-*");
                             Serial.println("");
-                            Serial.print(F("kimSST = ")); Serial.println(kimSST);
                         }
 					} else {                              // Data Direction Register A
                         riot_Data[PADD] = regMDR;
@@ -498,6 +477,7 @@ static void memoryStore(void) {
                         PORTB |= ~portb;
 					}
 				} else {                                  // Port B 
+                    riot_Data[PBD] = regMDR;
 					rowSelect = (regMDR & 0x1e) >> 1;
 					thePin = U24_74145[rowSelect];
 				    if ((regMAR & bit0) == 0) {           // Data register B
@@ -555,8 +535,8 @@ static void memoryStore(void) {
 }
 
 /**
- * Functions used by the various addressing modes. Assuming you know that MAR
- * is the Memory Address Register, and MDR is the Memory Data Register, I think
+ * Functions used by the various addressing modes. Assuming you know that regMAR
+ * is the Memory Address Register, and regMDR is the Memory Data Register, I think
  * these are self-explanatory.
  */
 
@@ -750,7 +730,7 @@ static void executeOperation(void) {
 			Serial.print(Branches[regOP >> 5]);
 		else
 			Serial.print(Mnemonics[opIx]); 
-        Serial.print(" "); Serial.println(modeIDs[pgm_read_byte_near(aMode + regOP)]);
+        Serial.print(F(" ")); Serial.println(modeIDs[pgm_read_byte_near(aMode + regOP)]);
         delay(DEBUG_DELAY); 
 	}
 	
@@ -1099,12 +1079,16 @@ static void executeOperation(void) {
                         Serial.print((char) regA);
                     break;
                 case 4:  // Is a byte available on the serial interface?
-                    regPS |= psZ;  // default to "zero" - no data available
+                    regPS |= psZ;          // default to "zero" - no data available
                     if (Serial.available() > 0)
-                        regPS &= 0xff - psZ; // if data *is* available, reset "zero"
+                        regPS &= ~psZ;     // if data *is* available, reset "zero"
                 case 5:  // receive regA via serial - a "blocking" call
                     while (Serial.available() == 0);
                     regA = (uint8_t) Serial.read();
+                    break;
+                case 16: // slight pause, return with Z=1
+                    for (uint8_t ix=0; ix<200; ix++) { hwCycles += PINB & 0x01; }
+                    regPS |= psZ;
                     break;    
                 default:
                     break;
@@ -1140,7 +1124,9 @@ static void pollHardware(void) {
 		hwIRQ |= riot_IRQstate[ix] & riot_IRQenable[ix];
 	}
 	
-    if (hwNMI) {
+    if (hwNMI && 
+        ((regPC & 0x1FFF) < ROMstart) &&
+        (pgm_read_byte_near(operation + regOP) != opRTI)) {
         if (DEBUG_DELAY) {
             Serial.println(F("### NMI ###"));
             delay(DEBUG_DELAY);
@@ -1175,33 +1161,50 @@ static void pollHardware(void) {
  */
 
 static void pollHost(void) {
-    /*if (kRS) {
-        kRS = false;
-        hwRST = true;
-    }
+    byte pinb, pinc;
+    byte portb, portc;
+    byte ddrb,  ddrc;
 
-    if (kST) {
-        kST = false;
-        hwNMI = true;
-    }*/
-
-    if (kSST) {
-        kSST = false;
-        kimSST = !kimSST;
-    }
-    
-    if (kimSST) {
-
-        // In SST mode, instructions that are executed 
-        // out of ROM are not trapped.
+    // if ((regPC & 0x1FFF) < ROMstart) {
+        // Save the state of ports B and C
         
-        if (((regPC & 0x1FFF) < (ROMstart & 0x1FFF)) &&
-            (pgm_read_byte_near(operation + regOP) != opRTI))
-            hwNMI = true;
-        else 
-            hwNMI = false;
-    }
+        pinb = PINB;
+        pinc = PINC;
+        portb = PORTB;
+        portc = PORTC;
+        ddrb = DDRB;
+        ddrc = DDRC;
+          
+        // Check for ST or RS keys depressed
+        
+        DDRC &= ~bit5;                         // Set phantom column as input
+        pinMode(A5, INPUT);
+        digitalWrite(A5, HIGH);
+        DDRB |= (bit1 | bit2 | bit3);          // Set all rows as output
+        PORTB = PINB | (bit1 | bit2 | bit3);   // set all rows high
 
+        PORTB = PINB & ~bit1;                  // Set first row low
+        hwNMI = ((digitalRead(A5) == LOW) || (kimSST == true)) ? true : false;
+        while (digitalRead(A5) == LOW) {}
+        PORTB = PINB | bit1;                   // Return first row to high
+
+        PORTB = PINB & ~bit2;                  // Set second row low
+        hwRST = (digitalRead(A5) == LOW) ? true : false;
+        while (digitalRead(A5) == LOW) {}
+        PORTB = PINB | bit2;                   // Return second row to high
+        
+        PORTB = PINB & ~bit3;                  // Set third row low
+        if (digitalRead(A5) == LOW) kimSST = !kimSST;
+        while (digitalRead(A5) == LOW) {}
+        PORTB = PINB | bit3;                   // Return third row to high
+        
+        // Restore ports B and C to their original state
+        
+        DDRB = ddrb;
+        DDRC = ddrc;
+        PORTB = (pinb & ddrb) | (portb & ~ddrb);
+        PORTC = (pinc & ddrc) | (portc & ~ddrc);
+    //}
 }
 
 /**
@@ -1242,6 +1245,15 @@ void zeroRam(void) {
  * pollKey() checks for a pressed key during startup
  */
 
+// This table is used to translate electrical row/column coordinates to
+// physical layout enumeration: keys 1-4 on the bottom row, 5-8 on the
+// second row, etc. 0 means no key was pressed.
+
+const byte keyCode[] PROGMEM = {  0,  
+                                  1, 22,  7,  6,  5,  4,  3,  2, 
+                                  8, 23, 14, 13, 12, 11, 10,  9,
+                                 15, 24, 19, 21, 20, 18, 17, 16 };
+
 byte pollKey() {
     byte row[3];
     
@@ -1269,7 +1281,7 @@ byte pollKey() {
             }
         }
     }
-    return keyCode[theKey];
+    return pgm_read_byte_near(keyCode+theKey);
 } 
 
 /**
@@ -1329,6 +1341,10 @@ void mpuRun(void) {
 
     while (hwRDY) {
         if (hwRST) {
+            if (DEBUG_DELAY) {
+                Serial.println(F("### RST ###"));
+                delay(DEBUG_DELAY);
+            }
             regPS |= psI;
             regMAR = 0xfffc;
             indirection();
@@ -1372,7 +1388,7 @@ void mpuRun(void) {
  */
  
 void setup(void) {
-    Serial.begin(19200);
+    Serial.begin(57600);
 
     DEBUG_DELAY = 0;
 	zeroRam();
@@ -1383,9 +1399,12 @@ void setup(void) {
             // do nothing special
             break;
         case 1:
-            loadProgram(_BLACKJACK, 0x0200, sizeof(_BLACKJACK));
+            kimTTY = true;
             break;
         case 2:
+            loadProgram(_BLACKJACK, 0x0200, sizeof(_BLACKJACK));
+            break;
+        case 3:
             loadProgram(_MICROCHESS_0000, 0x0000, sizeof(_MICROCHESS_0000));
             loadProgram(_MICROCHESS_0070, 0x0070, sizeof(_MICROCHESS_0070));
             loadProgram(_MICROCHESS_0100, 0x0100, sizeof(_MICROCHESS_0100));
