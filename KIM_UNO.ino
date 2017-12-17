@@ -4,7 +4,7 @@
  *
  * This is a rehash of my PalmOS KIM-1 emulator (which I called
  * vKIM) to work with the Arduino-Mini in Oscar Vermeulen's 
- * KIM-UNO. Perhaps I should call this one ovKIM ...?
+ * KIM-UNO. 
  *
  * --------------------------------------------------------------
  *
@@ -25,8 +25,8 @@
 #include <avr/pgmspace.h>
 #include <EEPROM.h>
 
-uint16_t DEBUG_DELAY = 0;
-boolean IO_DEBUG = false;
+uint16_t DEBUG_DELAY;
+boolean IO_DEBUG;
 
 ///////
 // Meta-registers
@@ -198,7 +198,16 @@ uint16_t const ROMsize = 2048;
 uint16_t const ROMstart = 0x1800;
 #include "KIM_1_ROM.h"
 
+/**
+ * Opcode tables used by the 6502 emulation routines
+ */
+ 
 #include "OP_TABLES.h"
+
+/**
+ * Programs that are available to be copied to RAM at startup
+ */
+ 
 #include "PROGS.h"
 
 ////////////////////////////////
@@ -378,6 +387,10 @@ static void memoryFetch(void) {
                         Serial.println("");
                     }
 				} else {                              // KIM Port B
+                    // It's entirely possible that this is not correct, but the KIM ROM
+                    // never reads Port B, so it mostly doesn't matter -- any application
+                    // program that messes with Port B is problematic anyway.
+                    
 					if      (portb & bit1) regMDR = 0b11100011;
 					else if (portb & bit2) regMDR = 0b11100101; 
 					else if (portb & bit3) regMDR = 0b11100111; 
@@ -1165,46 +1178,42 @@ static void pollHost(void) {
     byte portb, portc;
     byte ddrb,  ddrc;
 
-    // if ((regPC & 0x1FFF) < ROMstart) {
-        // Save the state of ports B and C
+    // Save the state of ports B and C
         
-        pinb = PINB;
-        pinc = PINC;
-        portb = PORTB;
-        portc = PORTC;
-        ddrb = DDRB;
-        ddrc = DDRC;
-          
-        // Check for ST or RS keys depressed
-        
-        DDRC &= ~bit5;                         // Set phantom column as input
-        pinMode(A5, INPUT);
-        digitalWrite(A5, HIGH);
-        DDRB |= (bit1 | bit2 | bit3);          // Set all rows as output
-        PORTB = PINB | (bit1 | bit2 | bit3);   // set all rows high
+    pinb = PINB;
+    pinc = PINC;
+    portb = PORTB;
+    portc = PORTC;
+    ddrb = DDRB;
+    ddrc = DDRC;
 
-        PORTB = PINB & ~bit1;                  // Set first row low
-        hwNMI = ((digitalRead(A5) == LOW) || (kimSST == true)) ? true : false;
-        while (digitalRead(A5) == LOW) {}
-        PORTB = PINB | bit1;                   // Return first row to high
+    pinMode(A5, INPUT);
+    digitalWrite(A5, HIGH);
+    DDRB |= (bit1 | bit2 | bit3);          // Set all rows as output
+    PORTB = PINB | (bit1 | bit2 | bit3);   // set all rows high
 
-        PORTB = PINB & ~bit2;                  // Set second row low
-        hwRST = (digitalRead(A5) == LOW) ? true : false;
-        while (digitalRead(A5) == LOW) {}
-        PORTB = PINB | bit2;                   // Return second row to high
-        
-        PORTB = PINB & ~bit3;                  // Set third row low
-        if (digitalRead(A5) == LOW) kimSST = !kimSST;
-        while (digitalRead(A5) == LOW) {}
-        PORTB = PINB | bit3;                   // Return third row to high
-        
-        // Restore ports B and C to their original state
-        
-        DDRB = ddrb;
-        DDRC = ddrc;
-        PORTB = (pinb & ddrb) | (portb & ~ddrb);
-        PORTC = (pinc & ddrc) | (portc & ~ddrc);
-    //}
+    // Check for ST
+    digitalWrite(9, LOW);
+    hwNMI = ((digitalRead(A5) == LOW) || (kimSST == true)) ? true : false;
+    digitalWrite(9, HIGH);
+
+    // Check for RS
+    digitalWrite(10, LOW);
+    hwRST = (digitalRead(A5) == LOW) ? true : false;
+    digitalWrite(10, HIGH);
+    
+    // Check for SST
+    digitalWrite(11, LOW);
+    if (digitalRead(A5) == LOW) kimSST = !kimSST;
+    while (digitalRead(A5) == LOW) {}
+    digitalWrite(11, HIGH);
+
+    // Restore ports B and C to their original state
+    
+    DDRB = ddrb;
+    DDRC = ddrc;
+    PORTB = (pinb & ddrb) | (portb & ~ddrb);
+    PORTC = (pinc & ddrc) | (portc & ~ddrc);
 }
 
 /**
@@ -1394,22 +1403,29 @@ void setup(void) {
 	zeroRam();
 	setVectors();
     mpuInit();
+    
     switch (pollKey()) {
-        case 0:
+        case 0:      /* no key */
             // do nothing special
             break;
-        case 1:
+        case 1:      /* 0 key */
             kimTTY = true;
             break;
-        case 2:
-            loadProgram(_BLACKJACK, 0x0200, sizeof(_BLACKJACK));
-            break;
-        case 3:
+        case 2:      /*1 key */
             loadProgram(_MICROCHESS_0000, 0x0000, sizeof(_MICROCHESS_0000));
             loadProgram(_MICROCHESS_0070, 0x0070, sizeof(_MICROCHESS_0070));
             loadProgram(_MICROCHESS_0100, 0x0100, sizeof(_MICROCHESS_0100));
             loadProgram(_MICROCHESS_0200, 0x0200, sizeof(_MICROCHESS_0200));
             loadProgram(_MICROCHESS_1780, 0x1780, sizeof(_MICROCHESS_1780));
+            break;
+        case 3:      /* 2 key */
+            loadProgram(_BLACKJACK, 0x0200, sizeof(_BLACKJACK));
+            break;
+        case 4:      /* 3 key */
+            loadProgram(_WUMPUS_0000, 0x0000, sizeof(_WUMPUS_0000));
+            loadProgram(_WUMPUS_0050, 0x0050, sizeof(_WUMPUS_0050));
+            loadProgram(_WUMPUS_0100, 0x0100, sizeof(_WUMPUS_0100));
+            loadProgram(_WUMPUS_0200, 0x0200, sizeof(_WUMPUS_0200));
             break;
     }
 }
