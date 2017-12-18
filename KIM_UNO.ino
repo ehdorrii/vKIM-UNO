@@ -25,8 +25,16 @@
 #include <avr/pgmspace.h>
 #include <EEPROM.h>
 
-uint16_t DEBUG_DELAY;
-boolean IO_DEBUG;
+///////
+// Trace options for debugging
+///////
+
+boolean  TRACE_REGISTERS;
+boolean  TRACE_INSTRUCTIONS;
+boolean  TRACE_MEMORY_ACCESS;
+boolean  TRACE_IO;
+boolean  TRACE_HW_LINES;
+uint16_t TRACE_DELAY;
 
 ///////
 // Meta-registers
@@ -379,12 +387,13 @@ static void memoryFetch(void) {
                     // Special case: if row 3 is selected, KIM is testing for TTY jumper
                     if (((riot_Data[PBD] & 0x1E) == 0x06) && kimTTY) regMDR &= ~bit0;
                     
-                    if (IO_DEBUG) {
+                    if (TRACE_IO) {
                         Serial.print(F("RRR KIM: PortA ")); pb8(regMDR, "-*");
                         Serial.print(F("   AVR: PortB ")); pb8(portb, "-*");
                         Serial.print(F("  PortC ")); pb8(portc, "-*");
                         Serial.print(F("  PortD ")); pb8(portd, "-*");
                         Serial.println("");
+                        delay(TRACE_DELAY);
                     }
 				} else {                              // KIM Port B
                     // It's entirely possible that this is not correct, but the KIM ROM
@@ -412,11 +421,11 @@ static void memoryFetch(void) {
         regMDR = 0xff;
     }
 	
-    if (DEBUG_DELAY) { /*D*/
+    if (TRACE_MEMORY_ACCESS) { /*D*/
 	    Serial.print(F("Fetch: ")); px4(regMAR); 
 		Serial.print(F(": ")); px2(regMDR); 
 		Serial.println(""); 
-		delay(DEBUG_DELAY);
+		delay(TRACE_DELAY);
 	}
 
     incrementClock();
@@ -428,11 +437,11 @@ static void memoryStore(void) {
 	uint8_t rowSelect, thePin;
 	uint8_t portb, portc, portd;
 
-    if (DEBUG_DELAY) { /*D*/
+    if (TRACE_MEMORY_ACCESS) { /*D*/
 		Serial.print(F("Store: ")); px4(regMAR); 
 		Serial.print(F(": ")); px2(regMDR); 
 		Serial.println(""); 
-		delay(DEBUG_DELAY); 
+        delay(TRACE_DELAY);
 	}
 	
     regMAR &= 0x1fff;    // KIM-1 does not decode the 3 MSB of the address bus
@@ -463,12 +472,13 @@ static void memoryStore(void) {
                         PORTC = portc;
                         PORTB = portb;
 						
-                        if (IO_DEBUG) {
+                        if (TRACE_IO) {
                             Serial.print(F("WWW KIM: PortA ")); pb8(regMDR, "-*");
                             Serial.print(F("   AVR: PortB ")); pb8(portb, "-*");
                             Serial.print(F("  PortC ")); pb8(portc, "-*");
                             Serial.print(F("  PortD ")); pb8(portd, "-*");
                             Serial.println("");
+                            delay(TRACE_DELAY);
                         }
 					} else {                              // Data Direction Register A
                         riot_Data[PADD] = regMDR;
@@ -478,12 +488,13 @@ static void memoryStore(void) {
                         DDRD = portd;
                         DDRC = portc;
                         DDRB = portb;
-                        if (IO_DEBUG) {
+                        if (TRACE_IO) {
                             Serial.print(F("WWW KIM:  DDRA ")); pb8(regMDR, "v^");
                             Serial.print(F("   AVR:  DDRB ")); pb8(portb, "v^");
                             Serial.print(F("   DDRC ")); pb8(portc, "v^");
                             Serial.print(F("   DDRD ")); pb8(portd, "v^");
                             Serial.println("");
+                            delay(TRACE_DELAY);
                         }
                         PORTD |= ~portd;
                         PORTC |= ~portc;
@@ -496,9 +507,13 @@ static void memoryStore(void) {
 				    if ((regMAR & bit0) == 0) {           // Data register B
                         riot_Data[PBD] = regMDR;
 
-                        if (IO_DEBUG) {
+                        if (TRACE_IO) {
                             Serial.print(F("WWW KIM: PortB ")); pb8(regMDR, "-*");
-                            Serial.print(F("   AVR: Pin ")); Serial.print(thePin); 
+                            Serial.print(F("   AVR: Pin ")); 
+                            if (thePin != 255) 
+                                Serial.print(thePin); 
+                            else 
+                                Serial.print(F("not"));
                         }
 
                         // All digit selects logic 0
@@ -512,12 +527,10 @@ static void memoryStore(void) {
                             } else {
                                 digitalWrite(thePin, HIGH);
                             }
-                            if (IO_DEBUG) {
-                                Serial.print(F(" selected"));
-                            }
                         }
-                        if (IO_DEBUG) {
-                            Serial.println("");
+                        if (TRACE_IO) {
+                            Serial.println(F(" selected"));
+                            delay(TRACE_DELAY);
                         }
 
 					} else {    // DDR B
@@ -737,14 +750,14 @@ static void executeOperation(void) {
     else
         operandFetch(false);
         
-    if (DEBUG_DELAY) {  /*D*/
+    if (TRACE_INSTRUCTIONS) {
         Serial.print(F("Execute: ")); 
 		if (pgm_read_byte_near(operation + regOP) == opBCC)
 			Serial.print(Branches[regOP >> 5]);
 		else
 			Serial.print(Mnemonics[opIx]); 
         Serial.print(F(" ")); Serial.println(modeIDs[pgm_read_byte_near(aMode + regOP)]);
-        delay(DEBUG_DELAY); 
+        delay(TRACE_DELAY); 
 	}
 	
     switch (pgm_read_byte_near(operation + regOP)) {
@@ -1140,9 +1153,9 @@ static void pollHardware(void) {
     if (hwNMI && 
         ((regPC & 0x1FFF) < ROMstart) &&
         (pgm_read_byte_near(operation + regOP) != opRTI)) {
-        if (DEBUG_DELAY) {
+        if (TRACE_HW_LINES) {
             Serial.println(F("### NMI ###"));
-            delay(DEBUG_DELAY);
+            delay(TRACE_DELAY);
         }
         push((uint8_t)(regPC >> 8));
         push((uint8_t)(regPC & 0x00ff));
@@ -1153,9 +1166,9 @@ static void pollHardware(void) {
         regPC = regMAR;
         hwNMI = false;
     } else if (hwIRQ && ((regPS & psI) == 0)) {
-        if (DEBUG_DELAY) {
+        if (TRACE_HW_LINES) {
             Serial.println(F("### IRQ ###"));
-            delay(DEBUG_DELAY);
+            delay(TRACE_DELAY);
         }
         push((uint8_t)(regPC >> 8));
         push((uint8_t)(regPC & 0x00ff));
@@ -1200,6 +1213,7 @@ static void pollHost(void) {
     // Check for RS
     digitalWrite(10, LOW);
     hwRST = (digitalRead(A5) == LOW) ? true : false;
+    while (digitalRead(A5) == LOW) {}
     digitalWrite(10, HIGH);
     
     // Check for SST
@@ -1241,13 +1255,10 @@ static void setVectors(void) {
  */
 
 void zeroRam(void) {
-    int saveDD = DEBUG_DELAY;
-    DEBUG_DELAY = 0;
     regMDR = 0;
     for (regMAR=0; regMAR<RAMsize; regMAR++) memoryStore();
     for (regMAR=auxRAMstart; regMAR<(auxRAMstart+auxRAMsize); regMAR++) memoryStore();
     setVectors();
-    DEBUG_DELAY = saveDD;
 }
 
 /**
@@ -1350,9 +1361,9 @@ void mpuRun(void) {
 
     while (hwRDY) {
         if (hwRST) {
-            if (DEBUG_DELAY) {
+            if (TRACE_HW_LINES) {
                 Serial.println(F("### RST ###"));
-                delay(DEBUG_DELAY);
+                delay(TRACE_DELAY);
             }
             regPS |= psI;
             regMAR = 0xfffc;
@@ -1369,7 +1380,7 @@ void mpuRun(void) {
         opIx = pgm_read_byte_near(operation + regOP);
 
         executeOperation();
-        if (DEBUG_DELAY) {
+        if (TRACE_REGISTERS) {
             Serial.print(F("A=")); px2(regA);
             Serial.print(F(" X=")); px2(regX);
             Serial.print(F(" Y=")); px2(regY);
@@ -1382,7 +1393,7 @@ void mpuRun(void) {
             Serial.print(F(" PS=")); Serial.print(ps);
             Serial.print(F(" PC=")); px4(regPC);
             Serial.println("");
-            delay(DEBUG_DELAY);
+            delay(TRACE_DELAY);
         }
 
         incrementClock();
@@ -1399,7 +1410,15 @@ void mpuRun(void) {
 void setup(void) {
     Serial.begin(57600);
 
-    DEBUG_DELAY = 0;
+    // Don't change these -- to activate traces, change in loop()
+    
+    TRACE_REGISTERS = false;
+    TRACE_INSTRUCTIONS = false;
+    TRACE_MEMORY_ACCESS = false;
+    TRACE_IO = false;
+    TRACE_HW_LINES = false;
+    TRACE_DELAY = 0;
+
 	zeroRam();
 	setVectors();
     mpuInit();
@@ -1431,8 +1450,13 @@ void setup(void) {
 }
 
 void loop(void) {
-    DEBUG_DELAY = 0;
-    IO_DEBUG = false;
+    TRACE_REGISTERS = false;
+    TRACE_INSTRUCTIONS = false;
+    TRACE_MEMORY_ACCESS = false;
+    TRACE_IO = false;
+    TRACE_HW_LINES = false;
+    TRACE_DELAY = 0;
+    
 	mpuRun();
 }
 
