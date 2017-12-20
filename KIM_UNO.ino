@@ -31,10 +31,15 @@
 
 boolean  TRACE_REGISTERS;
 boolean  TRACE_INSTRUCTIONS;
+boolean  TRACE_INSTRUCTION_TIMING;
 boolean  TRACE_MEMORY_ACCESS;
 boolean  TRACE_IO;
 boolean  TRACE_HW_LINES;
+boolean  TRACE_ROM;
 uint16_t TRACE_DELAY;
+unsigned long BEGIN_TIME;
+unsigned long EXCLUDE_TIME;
+unsigned long EXECUTION_TIME;
 
 ///////
 // Meta-registers
@@ -57,11 +62,11 @@ uint8_t  opIx;         // index into tables organized by opcode
 
 /**
  * The implementation of cycle counting is not perfect, but it's probably
- * good enough for programs that use the timers as a source of randomness.
+ * good enough for most purposes.
  */
 
 uint32_t hwCycles;      // cycles since mpuInit()
-boolean PBC = false;    // Page-boundary-crossed flag: indicate an additional clock cycle 
+boolean PBC = false;    // Page-boundary-crossed flag: additional clock cycle used
 
 ///////
 // Programmer registers
@@ -87,11 +92,13 @@ uint8_t  regPS;     // status register
 ///////
 
 uint8_t   riot_Data[2][2];      // Port A/B data register
-uint8_t   riot_DDir[2][2];      // Port A/B data direction register (0=input 1=output)
-uint8_t   riot_Timer[2];        // Timer value
+uint8_t   riot_DataDir[2][2];   // Port A/B data direction register (0=input 1=output)
+uint8_t   riot_Timer[2];        // Timer value -- reads get this value
+uint8_t   riot_TimerSet[2];     // Timer value -- writes set this value
 uint16_t  riot_TimerScale[2];   // Timer scale - can be 1, 8, 64 or 1024
-boolean   riot_IRQenable[2];    // If true, IRQ is asserted when timer rolls over to 0xFF
-boolean   riot_IRQstate[2];     // The state of the 6530 internal IRQ flag
+boolean   riot_TimerExpired[2]; // Timer state -- independent from IRQ state
+boolean   riot_IrqEnabled[2];   // If true, IRQ is asserted when timer rolls over to 0xFF
+boolean   riot_IrqAsserted[2];  // The state of the 6530 internal IRQ flag
 
 // These are shortcuts for referring to ports as named in the KIM-1 ROM listings
 
@@ -120,15 +127,6 @@ boolean hwRST;      // reset
 boolean hwNMI;      // non-maskable interrupt
 boolean hwIRQ;      // interrupt
 
-uint8_t nmiSource;  // Originator of the NMI -- available via EMT #1
-#define nmiBRK 1    // BRK instruction
-#define nmiST  2    // STOP key was depressed
-#define nmiSST 4    // SST mode
-#define nmiOP  8    // invalid opcode
-uint8_t irqSource;  // Originator of the IRQ -- available via EMT #2
-#define irqTimer1 1
-#define irqTimer2 2
-
 ///////
 // BCD Decoder
 ///////
@@ -136,11 +134,11 @@ uint8_t irqSource;  // Originator of the IRQ -- available via EMT #2
 uint8_t U24_74145[] = {9, 10, 11, 255, 12, 13, A0, A1, A2, A3, 255, 255, 255, 255, 255, 255};  
 
 ///////
-// KIM-1 SST switch state
+// KIM-1 SST switch state, and TTY jumper state
 ///////
 
-boolean kimSST = false;
-boolean kimTTY = false;
+boolean kimSST = false;        // Toggled by the 'SST' key
+boolean kimTTY = false;        // Set by holding down '0' key during power-on
 
 ///////
 // Memory 
@@ -248,24 +246,9 @@ void pb8(uint8_t theValue, char* LoHi) {
     }
 }
 
-///////////////////////
-// Internal routines //
-///////////////////////
-
-static void incrementClock(void) {
-    hwCycles++;
-    for (int ix=0; ix<2; ix++) {              // For both 6530s
-		if ((hwCycles & riot_TimerScale[ix]) == 0) riot_Timer[ix]--;  // Decrement with scaling
-		if (riot_Timer[ix] == 0xff) {         // timer expires when it goes to -1
-			riot_TimerScale[ix] = 0;          // stop scaling after timer expires
-			if (riot_IRQenable[ix]) {
-                riot_IRQstate[ix] = true;
-                riot_Data[ix][1] &= (0xff - bit7);
-            }
-        }
-    }
-}   
-    
+/**
+ * Memory access routines
+ */
 
 /** IMPORTANT! *************************************************
  * ALL memory accesses happen via the following two functions. *
@@ -274,29 +257,24 @@ static void incrementClock(void) {
 /**
  *  Notes regarding 6530 I/O and Timer area:
  *
- *  A5 & A4 are not decoded (see notes by Ruud Baltissen). As a
- *  result, it appears as if the following is repeated 4 times in the memory
- *  map of a RIOT.
+ *  A5 & A4 are not decoded. As a result, it appears as if the 
+ *  following is repeated 4 times in the memory map of a RIOT.
  *
  *  A3 A2 A1 A0
  *  -- -- -- --
  *   0  0  p  0 : Data register (I/O) - p denotes which port - 0=A 1=B
  *   0  0  p  1 : Data Direction Register (I/O) 0=input 1=output
  *   x  1  s  s : Read/Write timer
- *                x=0 disables IRQ on PB7, x=1 enables (on both read and write)
- *                ss=prescaling factor - 00=1:1  01=8:1  10=64:1  11=1024:1
+ *
+ *      ss=timer scaling factor - 00=1:1  01=8:1  10=64:1  11=1024:1
+ *      x=0 disables IRQ on PB7, x=1 enables (on both read and write)
  *
  *  Timer counts down from the written value on each clock/scale cycle.
- *  When the timer reaches 0, and wraps to FF, an interrupt is generated
- *  (or not, if A3 was zero when the timer was written). Now the scale
+ *  When the timer reaches 0, and wraps to FF, the timer "expires" and
+ *  an if interrupts are enabled, then one is generated. Now the scale
  *  factor is ignored, and the timer decrements on every clock cycle.
- *  If PB7 is enabled by A3 and an interrupt occurs, PB7 will go low
- *  (remember that IRQ is asserted low).
- *
- *  After the timer expires, any read or write to the timer resets the 
- *  interrupt. However, the value of A3 during said read/write, still
- *  controls whether IRQ is *enabled*. When PB7 is used to generate IRQ,
- *  it should be set up as input in the DDR.
+ *  At the next timer read, the original timer value and scale factor
+ *  are restored, and the interrupt (if one was generated) is reset.
  */
 
 /**
@@ -307,7 +285,6 @@ static void incrementClock(void) {
  *    port  Ard'o  Port
  *    .pin    Pin  .Bit   Usage
  *   -----  -----  ----   ---------------------
- *                        segment illuminated high / key depressed low
  *   PAD.0    D2   PD.2   segA/colA  [ 0  7   E TTY]
  *   PAD.1    D3   PD.3   segB/colB  [ 1  8   F]
  *   PAD.2    D4   PD.4   segC/colC  [ 2  9  AD]
@@ -316,25 +293,21 @@ static void incrementClock(void) {
  *   PAD.5    D7   PD.7   segF/colF  [ 5  C  GO]
  *   PAD.6    D8   PB.0   segG/colG  [ 6  D  PC]
  *   PAD.7    --   ----   tty/tape i/o  <==--not defined in KIM-UNO
- *   -----    A5   PC.5   segDP [ST RS SST] <==--not defined in KIM
+ *   -----    A5   PC.5   segDP [ST RS SST] <==--not defined in KIM-1
  *   
  *   PBD.0    --   ----   tty/tape i/o  <==--not defined in KIM-UNO 
- * 
- *  PBD.4-1               keyboard row-enable -- selected row is LOW
+ *  PBD.4-1 
  *    0000    D9   PB.1   row0 [  0   1   2   3   4   5   6  ST ]
  *    0001   D10   PB.2   row1 [  7   8   9   A   B   C   D  RS ]
  *    0010   D11   PB.3   row2 [  E   F  AD  DA   +  GO  PC SST ]
- *    0011   ---   ----   row3 [TTY]        <==--not defined in KIM-UNO
- *  
- *  PBD.4-1               display digit-select -- selected digit is HIGH
+ *    0011   ---   ----   row3 [TTY]    <==--not defined in KIM-UNO
  *    0100   D12   PB.4   digit1
  *    0101   D13   PB.5   digit2
  *    0110    A0   PC.0   digit3
  *    0111    A1   PC.1   digit4
  *    1000    A2   PC.2   digit5
  *    1001    A3   PC.3   digit6
- *    -----   A4   PC.4   digit4.5 <==--not defined in KIM
- *
+ *    ----    A4   PC.4   digit4.5      <==--not defined in KIM-1
  *   PBD.5    --   ----   tty/tape i/o  <==--not defined in KIM-UNO   
  *   PBD.6    --   ----   configured as chip-select - not usable for data
  *   PBD.7    --   ----   tty/tape i/o  <==--not defined in KIM-UNO   
@@ -344,7 +317,7 @@ static void memoryFetch(void) {
     uint8_t riotSelect = 0, portSelect = 0, registerSelect = 0;
 	uint8_t portb, portc, portd;
 
-    regMAR &= 0x1fff;        /** KIM-1 does not decode the 3 MSBs of the address bus **/
+    regMAR &= 0x1fff;   /** KIM-1 does not decode the 3 MSBs of the address bus **/
 	
     if (regMAR < RAMsize)
         regMDR = memRAM[regMAR];
@@ -365,7 +338,7 @@ static void memoryFetch(void) {
 		        portSelect = (regMAR & bit1) >> 1;    // 0=PORTA  1=PORTB
                 registerSelect = (regMAR & bit0);     // 0=data register  1=data direction register
 
-                // Fetch relevent values -- data OR data direction -- for both ports
+                // Fetch relevent values -- data OR data direction
                 
 				if (registerSelect == 0) {            // Data register
 				    portb = PINB;
@@ -385,50 +358,54 @@ static void memoryFetch(void) {
                     regMDR |= bit7;
 
                     // Special case: if row 3 is selected, KIM is testing for TTY jumper
-                    if (((riot_Data[PBD] & 0x1E) == 0x06) && kimTTY) regMDR &= ~bit0;
+                    if (((riot_Data[PBD] & 0x1E) == 0x06) && kimTTY) 
+                        regMDR &= ~bit0;
+                    else
+                        regMDR |= bit0;
                     
-                    if (TRACE_IO) {
+                    if (TRACE_IO && (TRACE_ROM || (regPC < ROMstart))) {
+                        EXCLUDE_TIME = micros();
                         Serial.print(F("RRR KIM: PortA ")); pb8(regMDR, "-*");
                         Serial.print(F("   AVR: PortB ")); pb8(portb, "-*");
                         Serial.print(F("  PortC ")); pb8(portc, "-*");
                         Serial.print(F("  PortD ")); pb8(portd, "-*");
                         Serial.println("");
                         delay(TRACE_DELAY);
+                        BEGIN_TIME += micros() - EXCLUDE_TIME;
                     }
 				} else {                              // KIM Port B
                     // It's entirely possible that this is not correct, but the KIM ROM
                     // never reads Port B, so it mostly doesn't matter -- any application
-                    // program that messes with Port B is problematic anyway.
+                    // program that messes with Port B is problematic.
                     
-					if      (portb & bit1) regMDR = 0b11100011;
-					else if (portb & bit2) regMDR = 0b11100101; 
-					else if (portb & bit3) regMDR = 0b11100111; 
-					else if (portb & bit4) regMDR = 0b11101001; 
-					else if (portb & bit5) regMDR = 0b11101011; 
-					else if (portc & bit0) regMDR = 0b11101101; 
-					else if (portc & bit1) regMDR = 0b11101111; 
-					else if (portc & bit2) regMDR = 0b11110001; 
-					else if (portc & bit3) regMDR = 0b11110011; 
-					else                   regMDR = 0b11100001; 
+                    regMDR = riot_Data[PBD];
 				}
-            
 			}
-		} else {                                      // Timer
-            regMDR = riot_Timer[riotSelect];
-            riot_IRQenable[riotSelect] = (regMAR & bit3) >> 3;		    
+		} else {                                      // Timer reads
+            riot_IrqAsserted[riotSelect] = false;
+            riot_IrqEnabled[riotSelect] = (regMAR & bit3) != 0;
+            if ((regMAR & 0x000F) == 7) {
+                regMDR = (riot_TimerExpired[riotSelect]) ? bit7 : 0;
+            } else {
+                regMDR = riot_Timer[riotSelect];
+                riot_Timer[riotSelect] = riot_TimerSet[riotSelect];
+                riot_TimerExpired[riotSelect] = false;
+            }
 		}
     } else {
         regMDR = 0xff;
     }
 	
-    if (TRACE_MEMORY_ACCESS) { /*D*/
+    if (TRACE_MEMORY_ACCESS && (TRACE_ROM || (regPC < ROMstart))) {
+        EXCLUDE_TIME = micros();
 	    Serial.print(F("Fetch: ")); px4(regMAR); 
 		Serial.print(F(": ")); px2(regMDR); 
 		Serial.println(""); 
 		delay(TRACE_DELAY);
+        BEGIN_TIME += micros() - EXCLUDE_TIME;
 	}
 
-    incrementClock();
+    clockCycle();
 }
 
 
@@ -437,11 +414,13 @@ static void memoryStore(void) {
 	uint8_t rowSelect, thePin;
 	uint8_t portb, portc, portd;
 
-    if (TRACE_MEMORY_ACCESS) { /*D*/
+    if (TRACE_MEMORY_ACCESS && (TRACE_ROM || (regPC < ROMstart))) {
+        EXCLUDE_TIME = micros();
 		Serial.print(F("Store: ")); px4(regMAR); 
 		Serial.print(F(": ")); px2(regMDR); 
 		Serial.println(""); 
         delay(TRACE_DELAY);
+        BEGIN_TIME += micros() - EXCLUDE_TIME;
 	}
 	
     regMAR &= 0x1fff;    // KIM-1 does not decode the 3 MSB of the address bus
@@ -472,13 +451,15 @@ static void memoryStore(void) {
                         PORTC = portc;
                         PORTB = portb;
 						
-                        if (TRACE_IO) {
+                        if (TRACE_IO && (TRACE_ROM || (regPC < ROMstart))) {
+                            EXCLUDE_TIME = micros();
                             Serial.print(F("WWW KIM: PortA ")); pb8(regMDR, "-*");
                             Serial.print(F("   AVR: PortB ")); pb8(portb, "-*");
                             Serial.print(F("  PortC ")); pb8(portc, "-*");
                             Serial.print(F("  PortD ")); pb8(portd, "-*");
                             Serial.println("");
                             delay(TRACE_DELAY);
+                            BEGIN_TIME += micros() - EXCLUDE_TIME;
                         }
 					} else {                              // Data Direction Register A
                         riot_Data[PADD] = regMDR;
@@ -488,13 +469,15 @@ static void memoryStore(void) {
                         DDRD = portd;
                         DDRC = portc;
                         DDRB = portb;
-                        if (TRACE_IO) {
+                        if (TRACE_IO && (TRACE_ROM || (regPC < ROMstart))) {
+                            EXCLUDE_TIME = micros();
                             Serial.print(F("WWW KIM:  DDRA ")); pb8(regMDR, "v^");
                             Serial.print(F("   AVR:  DDRB ")); pb8(portb, "v^");
                             Serial.print(F("   DDRC ")); pb8(portc, "v^");
                             Serial.print(F("   DDRD ")); pb8(portd, "v^");
                             Serial.println("");
                             delay(TRACE_DELAY);
+                            BEGIN_TIME += micros() - EXCLUDE_TIME;
                         }
                         PORTD |= ~portd;
                         PORTC |= ~portc;
@@ -507,13 +490,15 @@ static void memoryStore(void) {
 				    if ((regMAR & bit0) == 0) {           // Data register B
                         riot_Data[PBD] = regMDR;
 
-                        if (TRACE_IO) {
+                        if (TRACE_IO && (TRACE_ROM || (regPC < ROMstart))) {
+                            EXCLUDE_TIME = micros();
                             Serial.print(F("WWW KIM: PortB ")); pb8(regMDR, "-*");
                             Serial.print(F("   AVR: Pin ")); 
                             if (thePin != 255) 
                                 Serial.print(thePin); 
                             else 
                                 Serial.print(F("not"));
+                            BEGIN_TIME += micros() - EXCLUDE_TIME;
                         }
 
                         // All digit selects logic 0
@@ -528,9 +513,11 @@ static void memoryStore(void) {
                                 digitalWrite(thePin, HIGH);
                             }
                         }
-                        if (TRACE_IO) {
+                        if (TRACE_IO && (TRACE_ROM || (regPC < ROMstart))) {
+                            EXCLUDE_TIME = micros();
                             Serial.println(F(" selected"));
                             delay(TRACE_DELAY);
+                            BEGIN_TIME += micros() - EXCLUDE_TIME;
                         }
 
 					} else {    // DDR B
@@ -546,6 +533,8 @@ static void memoryStore(void) {
 			}                                     
 			
 		} else {                                  // Timer
+            riot_TimerExpired[riotSelect] = false;
+            riot_TimerSet[riotSelect] = regMDR;
             riot_Timer[riotSelect] = regMDR;
 			
 			// TimerScale is set to (factor - 1), which produces a mask we
@@ -553,11 +542,12 @@ static void memoryStore(void) {
 			// Timer is only decremented when the selected bits are all zero.
 			
             riot_TimerScale[riotSelect] = scaleFactors[regMAR & (bit1|bit0)] - 1;
-            riot_IRQenable[riotSelect] = (regMAR & bit3) >> 3;	
+            riot_IrqEnabled[riotSelect] = (regMAR & bit3) >> 3;
+            riot_IrqAsserted[riotSelect] = false;
 		}
     }
 
-    incrementClock();
+    clockCycle();
 }
 
 /**
@@ -750,7 +740,8 @@ static void executeOperation(void) {
     else
         operandFetch(false);
         
-    if (TRACE_INSTRUCTIONS) {
+    if (TRACE_INSTRUCTIONS && (TRACE_ROM || (regPC < ROMstart))) {
+        EXCLUDE_TIME = micros();
         Serial.print(F("Execute: ")); 
 		if (pgm_read_byte_near(operation + regOP) == opBCC)
 			Serial.print(Branches[regOP >> 5]);
@@ -758,6 +749,7 @@ static void executeOperation(void) {
 			Serial.print(Mnemonics[opIx]); 
         Serial.print(F(" ")); Serial.println(modeIDs[pgm_read_byte_near(aMode + regOP)]);
         delay(TRACE_DELAY); 
+        BEGIN_TIME += micros() - EXCLUDE_TIME;
 	}
 	
     switch (pgm_read_byte_near(operation + regOP)) {
@@ -817,9 +809,19 @@ static void executeOperation(void) {
 	        }
 	        theBit &= regPS;
             if (regOP & 0x20) {
-                if (theBit)  { regPC = regMAR; incrementClock(); if (PBC) incrementClock(); PBC = false; }
+                if (theBit) { 
+                    regPC = regMAR; 
+                    clockCycle(); 
+                    if (PBC) clockCycle(); 
+                    PBC = false; 
+                }
             } else {
-                if (!theBit) { regPC = regMAR; incrementClock(); if (PBC) incrementClock(); PBC = false; }
+                if (!theBit) { 
+                    regPC = regMAR; 
+                    clockCycle(); 
+                    if (PBC) clockCycle(); 
+                    PBC = false; 
+                }
             }
             break;
 
@@ -835,7 +837,6 @@ static void executeOperation(void) {
             regPC++;
             regPS |= psB;
             hwNMI = true;
-            nmiSource = nmiBRK;
             break;
 
         case opCLC:
@@ -1094,12 +1095,6 @@ static void executeOperation(void) {
              * EMT is a mnemonic for "Emulator Trap".
              */
             switch (regMDR) {
-                case 1:  // return NMI source
-                    regA = nmiSource;
-                    break;
-                case 2:  // return IRQ source
-                    regA = irqSource;
-                    break;
                 case 3:  // send regA via serial
                     if (regA != 0)
                         Serial.print((char) regA);
@@ -1122,7 +1117,6 @@ static void executeOperation(void) {
 	        break;
         default:
             hwNMI = true;
-            nmiSource = nmiOP;
             break;
     }
     setStatus();
@@ -1137,9 +1131,7 @@ static void executeOperation(void) {
 }
 
 /**
- * pollHardware() looks at hardware states and responds to them. Mostly this
- * means checking the emulated processor lines (RST, IRQ, NMI), but part of
- * that involves polling the keypad for ST/RS/SST keypresses.
+ * pollHardware() looks at hardware states and responds to them.
  */
 
 static void pollHardware(void) {
@@ -1147,15 +1139,17 @@ static void pollHardware(void) {
 	// Check for IRQ from the RIOTs
 	
 	for (int ix=0; ix<2; ix++) {
-		hwIRQ |= riot_IRQstate[ix] & riot_IRQenable[ix];
+		hwIRQ |= riot_IrqAsserted[ix];
 	}
 	
     if (hwNMI && 
         ((regPC & 0x1FFF) < ROMstart) &&
         (pgm_read_byte_near(operation + regOP) != opRTI)) {
         if (TRACE_HW_LINES) {
+            EXCLUDE_TIME = micros();
             Serial.println(F("### NMI ###"));
             delay(TRACE_DELAY);
+            BEGIN_TIME += micros() - EXCLUDE_TIME;
         }
         push((uint8_t)(regPC >> 8));
         push((uint8_t)(regPC & 0x00ff));
@@ -1167,8 +1161,10 @@ static void pollHardware(void) {
         hwNMI = false;
     } else if (hwIRQ && ((regPS & psI) == 0)) {
         if (TRACE_HW_LINES) {
+            EXCLUDE_TIME = micros();
             Serial.println(F("### IRQ ###"));
             delay(TRACE_DELAY);
+            BEGIN_TIME += micros() - EXCLUDE_TIME;
         }
         push((uint8_t)(regPC >> 8));
         push((uint8_t)(regPC & 0x00ff));
@@ -1208,6 +1204,7 @@ static void pollHost(void) {
     // Check for ST
     digitalWrite(9, LOW);
     hwNMI = ((digitalRead(A5) == LOW) || (kimSST == true)) ? true : false;
+    while (digitalRead(A5) == LOW) {}
     digitalWrite(9, HIGH);
 
     // Check for RS
@@ -1229,6 +1226,31 @@ static void pollHost(void) {
     PORTB = (pinb & ddrb) | (portb & ~ddrb);
     PORTC = (pinc & ddrc) | (portc & ~ddrc);
 }
+
+/**
+ * Clock cycles are tracked here
+ */
+ 
+static void clockCycle(void) {
+    hwCycles++;
+    
+    for (int ix=0; ix<2; ix++) {              // For both 6530s
+    
+        // If timer has expired, decrement on every cycle
+        // Otherwise, decrement only at the rate determined by TimerScale
+        
+		if (((hwCycles & riot_TimerScale[ix]) == 0) || 
+            (riot_TimerExpired[ix] == true)) riot_Timer[ix]--;
+            
+        // The timer is considered to have expired when it rolls from 00 to FF
+        
+		if ((riot_Timer[ix] == 0xff) && (riot_TimerExpired[ix] == false)) {
+            riot_TimerExpired[ix] = true;        
+			riot_IrqAsserted[ix] = riot_IrqEnabled[ix];
+        }
+    }
+}   
+    
 
 /**
  * setVectors() is a convenience for users -- whenever memory is cleared by the
@@ -1319,19 +1341,35 @@ void loadProgram(uint8_t *theProgram, uint16_t theLocation, uint16_t theSize) {
     }
 }
 
+void setEntryPoint(uint16_t theAddress) {            
+    regMAR = 0x00FA;
+    regMDR = (byte) (theAddress & 0xFF);
+    memoryStore();
+    regMAR++;
+    regMDR = (byte) (theAddress >> 8);
+        memoryStore();
+}
 
-///////////////////////////
-// Public methods follow //
-///////////////////////////
+void riotReset(uint8_t device) {
+	riot_Data[device][0] = 0;
+	riot_DataDir[device][0] = 0;
+    riot_Data[device][1] = 0;
+    riot_DataDir[device][1] = 0;
+	riot_Timer[device] = 0;
+	riot_TimerSet[device] = 0;
+	riot_TimerScale[device] = 0;
+	riot_TimerExpired[device] = false;
+	riot_IrqEnabled[device] = false;
+	riot_IrqAsserted[device] = false;
+}
 
 
 void mpuInit(void) {
     regA = regX = regY = regSP = regPS = 0;
     regPC = 0;
     
-    hwRST = hwRDY = true;
+    hwRDY = true;
     hwNMI = hwIRQ = false;
-    nmiSource = irqSource = 0;
     
     regMAR = regALUout = 0;
     regMDR = regALUin = regOP = 0;
@@ -1340,39 +1378,32 @@ void mpuInit(void) {
 }
 
 
-void riotReset(uint8_t device) {
-	riot_Data[device][0] = 0;
-	riot_DDir[device][0] = 0;
-    riot_Data[device][1] = 0;
-    riot_DDir[device][1] = 0;
-	riot_Timer[device] = 0;
-	riot_TimerScale[device] = 0;
-	riot_IRQenable[device] = false;
-	riot_IRQstate[device] = false;
-}
-
-
 void mpuRun(void) {
     char psbits[8] = "nv-bdizc";
     char ps[9];
 
-    hwRDY = true;
-    hwCycles = 0;
-
     while (hwRDY) {
+        EXECUTION_TIME = micros() - BEGIN_TIME;
+        if (TRACE_INSTRUCTION_TIMING) {
+            Serial.print(F("Cycles=")); Serial.print(hwCycles);
+            Serial.print(F("  uSec=")); Serial.println(EXECUTION_TIME);
+        }
+        BEGIN_TIME = micros();
         if (hwRST) {
             if (TRACE_HW_LINES) {
+                EXCLUDE_TIME = micros();
                 Serial.println(F("### RST ###"));
                 delay(TRACE_DELAY);
+                BEGIN_TIME += micros() - EXCLUDE_TIME;
             }
+            hwRST = false;
+            riotReset(0);
+			riotReset(1);
+            mpuInit();
             regPS |= psI;
             regMAR = 0xfffc;
             indirection();
             regPC = regMAR;
-            hwRST = hwIRQ = hwNMI = false;
-			nmiSource = 0; irqSource = 0;
-            riotReset(0);
-			riotReset(1);
         }
         regMAR = regPC++;
         memoryFetch();
@@ -1380,7 +1411,8 @@ void mpuRun(void) {
         opIx = pgm_read_byte_near(operation + regOP);
 
         executeOperation();
-        if (TRACE_REGISTERS) {
+        if (TRACE_REGISTERS && (TRACE_ROM || (regPC < ROMstart))) {
+            EXCLUDE_TIME = micros();
             Serial.print(F("A=")); px2(regA);
             Serial.print(F(" X=")); px2(regX);
             Serial.print(F(" Y=")); px2(regY);
@@ -1394,34 +1426,32 @@ void mpuRun(void) {
             Serial.print(F(" PC=")); px4(regPC);
             Serial.println("");
             delay(TRACE_DELAY);
+            BEGIN_TIME += micros() - EXCLUDE_TIME;
         }
 
-        incrementClock();
+        clockCycle();
         pollHost();
         pollHardware();
     }
 }
 
 
-/**
- * Arduino required functions
- */
- 
 void setup(void) {
     Serial.begin(57600);
 
-    // Don't change these -- to activate traces, change in loop()
+    // Don't change these!! -- to activate traces, change them in loop()
     
     TRACE_REGISTERS = false;
     TRACE_INSTRUCTIONS = false;
+    TRACE_INSTRUCTION_TIMING = false;
     TRACE_MEMORY_ACCESS = false;
     TRACE_IO = false;
     TRACE_HW_LINES = false;
+    TRACE_ROM = false;
     TRACE_DELAY = 0;
 
 	zeroRam();
 	setVectors();
-    mpuInit();
     
     switch (pollKey()) {
         case 0:      /* no key */
@@ -1430,33 +1460,40 @@ void setup(void) {
         case 1:      /* 0 key */
             kimTTY = true;
             break;
-        case 2:      /*1 key */
+        case 2:      /* 1 key */
             loadProgram(_MICROCHESS_0000, 0x0000, sizeof(_MICROCHESS_0000));
             loadProgram(_MICROCHESS_0070, 0x0070, sizeof(_MICROCHESS_0070));
             loadProgram(_MICROCHESS_0100, 0x0100, sizeof(_MICROCHESS_0100));
             loadProgram(_MICROCHESS_0200, 0x0200, sizeof(_MICROCHESS_0200));
             loadProgram(_MICROCHESS_1780, 0x1780, sizeof(_MICROCHESS_1780));
+            setEntryPoint(_MICROCHESS_ENTRY);
             break;
         case 3:      /* 2 key */
             loadProgram(_BLACKJACK, 0x0200, sizeof(_BLACKJACK));
+            setEntryPoint(_BLACKJACK_ENTRY);
             break;
         case 4:      /* 3 key */
             loadProgram(_WUMPUS_0000, 0x0000, sizeof(_WUMPUS_0000));
             loadProgram(_WUMPUS_0050, 0x0050, sizeof(_WUMPUS_0050));
             loadProgram(_WUMPUS_0100, 0x0100, sizeof(_WUMPUS_0100));
             loadProgram(_WUMPUS_0200, 0x0200, sizeof(_WUMPUS_0200));
+            setEntryPoint(_WUMPUS_ENTRY);
             break;
     }
 }
 
 void loop(void) {
-    TRACE_REGISTERS = false;
-    TRACE_INSTRUCTIONS = false;
+    TRACE_REGISTERS = true;
+    TRACE_INSTRUCTIONS = true;
+    TRACE_INSTRUCTION_TIMING = false;
     TRACE_MEMORY_ACCESS = false;
-    TRACE_IO = false;
+    TRACE_IO = true;
     TRACE_HW_LINES = false;
+    TRACE_ROM = false;
     TRACE_DELAY = 0;
     
+    mpuInit();
+    hwRST = true;
+    BEGIN_TIME = micros();
 	mpuRun();
 }
-
