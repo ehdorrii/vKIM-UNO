@@ -42,6 +42,13 @@ unsigned long EXCLUDE_TIME;
 unsigned long EXECUTION_TIME;
 
 ///////
+// Symbolic addresses for value store in EEPROM
+///////
+ 
+#define eeaLED   0
+#define eeaTTY   4
+
+///////
 // Meta-registers
 ///////
 
@@ -132,6 +139,8 @@ boolean hwIRQ;      // interrupt
 ///////
 
 uint8_t U24_74145[] = {9, 10, 11, 255, 12, 13, A0, A1, A2, A3, 255, 255, 255, 255, 255, 255};  
+uint8_t ledGap[]    = {12, 13, A0, A1};
+uint8_t ledNoGap[]  = {13, A0, A1, A4};
 
 ///////
 // KIM-1 SST switch state, and TTY jumper state
@@ -862,10 +871,12 @@ static void executeOperation(void) {
 
         case opCPX:
             regALUout = regX - regALUin;
+            regALUout ^= 0x0100;
             break;
 
         case opCPY:
             regALUout = regY - regALUin;
+            regALUout ^= 0x0100;
             break;
 
         case opDEC:
@@ -1204,7 +1215,7 @@ static void pollHost(void) {
     // Check for ST
     digitalWrite(9, LOW);
     hwNMI = ((digitalRead(A5) == LOW) || (kimSST == true)) ? true : false;
-    while (digitalRead(A5) == LOW) {}
+    // while (digitalRead(A5) == LOW) {}
     digitalWrite(9, HIGH);
 
     // Check for RS
@@ -1342,25 +1353,25 @@ void loadProgram(uint8_t *theProgram, uint16_t theLocation, uint16_t theSize) {
 }
 
 void setEntryPoint(uint16_t theAddress) {            
-    regMAR = 0x00FA;
     regMDR = (byte) (theAddress & 0xFF);
+    regMAR = 0x00FA;
     memoryStore();
     regMAR++;
     regMDR = (byte) (theAddress >> 8);
-        memoryStore();
+    memoryStore();
 }
 
 void riotReset(uint8_t device) {
-	riot_Data[device][0] = 0;
-	riot_DataDir[device][0] = 0;
+	  riot_Data[device][0] = 0;
+	  riot_DataDir[device][0] = 0;
     riot_Data[device][1] = 0;
     riot_DataDir[device][1] = 0;
-	riot_Timer[device] = 0;
-	riot_TimerSet[device] = 0;
-	riot_TimerScale[device] = 0;
-	riot_TimerExpired[device] = false;
-	riot_IrqEnabled[device] = false;
-	riot_IrqAsserted[device] = false;
+	  riot_Timer[device] = 0;
+	  riot_TimerSet[device] = 0;
+	  riot_TimerScale[device] = 0;
+	  riot_TimerExpired[device] = false;
+	  riot_IrqEnabled[device] = false;
+  	riot_IrqAsserted[device] = false;
 }
 
 
@@ -1437,30 +1448,51 @@ void mpuRun(void) {
 
 
 void setup(void) {
+    uint8_t ix;
+    
     Serial.begin(57600);
 
-    // Don't change these!! -- to activate traces, change them in loop()
-    
-    TRACE_REGISTERS = false;
-    TRACE_INSTRUCTIONS = false;
-    TRACE_INSTRUCTION_TIMING = false;
-    TRACE_MEMORY_ACCESS = false;
-    TRACE_IO = false;
-    TRACE_HW_LINES = false;
-    TRACE_ROM = false;
     TRACE_DELAY = 0;
+    TRACE_MEMORY_ACCESS = false;
+	  zeroRam();
+	  setVectors();
 
-	zeroRam();
-	setVectors();
+    uint8_t testValue = EEPROM.read(eeaLED);
+    if ((testValue==12) || (testValue==13)) {  
+        for (ix=0; ix<4; ix++)
+            U24_74145[ix+4] = EEPROM.read(ix+eeaLED);
+    } else {
+        for (ix=0; ix<4; ix++)
+            EEPROM.write(ix+eeaLED, U24_74145[ix+4]);
+    }
+
+    kimTTY = (EEPROM.read(eeaTTY) == 1) ? true : false;
     
     switch (pollKey()) {
         case 0:      /* no key */
             // do nothing special
             break;
-        case 1:      /* 0 key */
-            kimTTY = true;
+        case 1:      /* 0 key - use keyboad & display */
+            kimTTY = false;
+            EEPROM.write(eeaTTY, 0);
             break;
-        case 2:      /* 1 key */
+        case 2:      /* 1 key - use serial interface */
+            kimTTY = true;
+            EEPROM.write(eeaTTY, 1);
+            break;
+        case 3:      /* 2 key - display digits with a gap: XXXX XX */
+            for (uint8_t ix=0; ix<4; ix++) {
+                U24_74145[ix+4] = ledGap[ix];
+                EEPROM.write(ix+eeaLED, ledGap[ix]);
+            }
+            break;
+        case 4:      /* 3 key - display digits without a gap: XXXXXX */
+            for (uint8_t ix=0; ix<4; ix++) {
+                U24_74145[ix+4] = ledNoGap[ix];
+                EEPROM.write(ix+eeaLED, ledNoGap[ix]);
+            }
+            break;
+        case 5:      /* 4 key */
             loadProgram(_MICROCHESS_0000, 0x0000, sizeof(_MICROCHESS_0000));
             loadProgram(_MICROCHESS_0070, 0x0070, sizeof(_MICROCHESS_0070));
             loadProgram(_MICROCHESS_0100, 0x0100, sizeof(_MICROCHESS_0100));
@@ -1468,11 +1500,11 @@ void setup(void) {
             loadProgram(_MICROCHESS_1780, 0x1780, sizeof(_MICROCHESS_1780));
             setEntryPoint(_MICROCHESS_ENTRY);
             break;
-        case 3:      /* 2 key */
+        case 6:      /* 5 key */
             loadProgram(_BLACKJACK, 0x0200, sizeof(_BLACKJACK));
             setEntryPoint(_BLACKJACK_ENTRY);
             break;
-        case 4:      /* 3 key */
+        case 7:      /* 6 key */
             loadProgram(_WUMPUS_0000, 0x0000, sizeof(_WUMPUS_0000));
             loadProgram(_WUMPUS_0050, 0x0050, sizeof(_WUMPUS_0050));
             loadProgram(_WUMPUS_0100, 0x0100, sizeof(_WUMPUS_0100));
@@ -1483,11 +1515,14 @@ void setup(void) {
 }
 
 void loop(void) {
-    TRACE_REGISTERS = true;
-    TRACE_INSTRUCTIONS = true;
+    
+    // enhanced granularity of traces
+    
+    TRACE_REGISTERS = false;
+    TRACE_INSTRUCTIONS = false;
     TRACE_INSTRUCTION_TIMING = false;
     TRACE_MEMORY_ACCESS = false;
-    TRACE_IO = true;
+    TRACE_IO = false;
     TRACE_HW_LINES = false;
     TRACE_ROM = false;
     TRACE_DELAY = 0;
