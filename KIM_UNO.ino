@@ -367,10 +367,12 @@ static void memoryFetch(void) {
                     regMDR |= bit7;
 
                     // Special case: if row 3 is selected, KIM is testing for TTY jumper
-                    if (((riot_Data[PBD] & 0x1E) == 0x06) && kimTTY) 
-                        regMDR &= ~bit0;
-                    else
-                        regMDR |= bit0;
+                    if ((riot_Data[PBD] & 0x1E) == 0x06) {
+                        if (kimTTY) 
+                            regMDR &= ~bit0;
+                        else
+                            regMDR |= bit0;
+                    }
                     
                     if (TRACE_IO && (TRACE_ROM || (regPC < ROMstart))) {
                         EXCLUDE_TIME = micros();
@@ -473,7 +475,7 @@ static void memoryStore(void) {
 					} else {                              // Data Direction Register A
                         riot_Data[PADD] = regMDR;
 						portd = (DDRD & 0x03) | (regMDR << 2);
-                        portc = (DDRC & 0xDF) | (regMDR & bit5);   // make segDP direction same as other segments
+                        portc = (DDRC & 0xDF) | (regMDR & bit5);  // make segDP direction same as other segments
                         portb = (DDRB & 0xFE) | ((regMDR & bit6) >> 6);
                         DDRD = portd;
                         DDRC = portc;
@@ -510,11 +512,15 @@ static void memoryStore(void) {
                             BEGIN_TIME += micros() - EXCLUDE_TIME;
                         }
 
-                        // All digit selects logic 0
+                        // Set all digit selects to logic 0
+                        
                         PORTB = PINB & (0xff ^ (bit4 | bit5));
                         PORTC = PINC & (0xff ^ (bit0 | bit1 | bit2 | bit3 | bit4));
-                        // All row selects logic 1
+                        
+                        // Set all row selects to logic 1
+                        
                         PORTB = PINB | (bit1 | bit2 | bit3);
+                        
                         if (thePin != 255) {
                             if (rowSelect < 4) {
                                 digitalWrite(thePin, LOW);
@@ -730,7 +736,7 @@ static void setStatus(void) {
 /**
  * Instructions are executed here. Instructions of special interest:
  *
- *  - ADC and SBC (special handling of PS overflow bit; decimal mode is iffy!)
+ *  - ADC and SBC (special handling of PS overflow bit)
  *  - BRK (increments PC by 2!)
  *  - EMT (emulator interactions)
  *
@@ -1114,13 +1120,29 @@ static void executeOperation(void) {
                     regPS |= psZ;          // default to "zero" - no data available
                     if (Serial.available() > 0)
                         regPS &= ~psZ;     // if data *is* available, reset "zero"
+                    break;
                 case 5:  // receive regA via serial - a "blocking" call
-                    while (Serial.available() == 0);
+                    pinMode(A5, OUTPUT);
+                    digitalWrite(A5, LOW);
+                    DDRC = 0x3f;
+                    while (Serial.available() == 0) {
+                        for (uint8_t ix=0; ix<6; ix++) {
+                            digitalWrite(U24_74145[ix+4], HIGH);
+                            delay(1);
+                            digitalWrite(U24_74145[ix+4], LOW);
+                        }
+                    }
                     regA = (uint8_t) Serial.read();
                     break;
-                case 16: // slight pause, return with Z=1
+                case 16: 
+                    // slight pause, return with Z=1; turn off digit select line.
+                    // special for Blackjack
+                    // REMOVE BEFORE DISTRIBUTION
                     for (uint8_t ix=0; ix<200; ix++) { hwCycles += PINB & 0x01; }
                     regPS |= psZ;
+                    regMDR = 0;
+                    regMAR = 0x1742;
+                    memoryStore();
                     break;    
                 default:
                     break;
@@ -1156,12 +1178,6 @@ static void pollHardware(void) {
     if (hwNMI && 
         ((regPC & 0x1FFF) < ROMstart) &&
         (pgm_read_byte_near(operation + regOP) != opRTI)) {
-        if (TRACE_HW_LINES) {
-            EXCLUDE_TIME = micros();
-            Serial.println(F("### NMI ###"));
-            delay(TRACE_DELAY);
-            BEGIN_TIME += micros() - EXCLUDE_TIME;
-        }
         push((uint8_t)(regPC >> 8));
         push((uint8_t)(regPC & 0x00ff));
         push(regPS);
@@ -1171,12 +1187,6 @@ static void pollHardware(void) {
         regPC = regMAR;
         hwNMI = false;
     } else if (hwIRQ && ((regPS & psI) == 0)) {
-        if (TRACE_HW_LINES) {
-            EXCLUDE_TIME = micros();
-            Serial.println(F("### IRQ ###"));
-            delay(TRACE_DELAY);
-            BEGIN_TIME += micros() - EXCLUDE_TIME;
-        }
         push((uint8_t)(regPC >> 8));
         push((uint8_t)(regPC & 0x00ff));
         push(regPS);
@@ -1362,16 +1372,16 @@ void setEntryPoint(uint16_t theAddress) {
 }
 
 void riotReset(uint8_t device) {
-	  riot_Data[device][0] = 0;
-	  riot_DataDir[device][0] = 0;
+    riot_Data[device][0] = 0;
+    riot_DataDir[device][0] = 0;
     riot_Data[device][1] = 0;
     riot_DataDir[device][1] = 0;
-	  riot_Timer[device] = 0;
-	  riot_TimerSet[device] = 0;
-	  riot_TimerScale[device] = 0;
-	  riot_TimerExpired[device] = false;
-	  riot_IrqEnabled[device] = false;
-  	riot_IrqAsserted[device] = false;
+    riot_Timer[device] = 0;
+    riot_TimerSet[device] = 0;
+    riot_TimerScale[device] = 0;
+    riot_TimerExpired[device] = false;
+    riot_IrqEnabled[device] = false;
+    riot_IrqAsserted[device] = false;
 }
 
 
@@ -1452,10 +1462,9 @@ void setup(void) {
     
     Serial.begin(57600);
 
-    TRACE_DELAY = 0;
     TRACE_MEMORY_ACCESS = false;
-	  zeroRam();
-	  setVectors();
+    zeroRam();
+    setVectors();
 
     uint8_t testValue = EEPROM.read(eeaLED);
     if ((testValue==12) || (testValue==13)) {  
@@ -1510,6 +1519,18 @@ void setup(void) {
             loadProgram(_WUMPUS_0100, 0x0100, sizeof(_WUMPUS_0100));
             loadProgram(_WUMPUS_0200, 0x0200, sizeof(_WUMPUS_0200));
             setEntryPoint(_WUMPUS_ENTRY);
+            break;
+        case 8:      /* 7 key */
+            loadProgram(_ASTEROID, 0x0200, sizeof(_ASTEROID));
+            setEntryPoint(_ASTEROID_ENTRY);
+            break;
+        case 9:      /* 8 key */
+            loadProgram(_CLOCK, 0x0300, sizeof(_CLOCK));
+            setEntryPoint(_CLOCK_ENTRY);
+            break;
+        case 10:      /* 9 key */
+            loadProgram(_DEC_TEST, 0x0200, sizeof(_DEC_TEST));
+            setEntryPoint(_DEC_TEST_ENTRY);
             break;
     }
 }
