@@ -119,7 +119,7 @@ opSED, opSBC, opZZZ, opZZZ, opZZZ, opSBC, opINC, opZZZ  // F8
 };
 
 /**
- * The follwoing two tables are provided for trace
+ * The following two tables are provided for trace
  */
 
 char *Mnemonics[51] = { "---", "ADC", "AND", "ASL", "bcc", "BIT", "BRK", "CLC",
@@ -141,6 +141,7 @@ char *Branches[8] = {"BPL", "BMI", "BVC", "BVS", "BCC", "BCS", "BNE", "BEQ"};
 #define NZ   (psN | psZ)
 #define NZC  (psN | psZ | psC)
 #define NVZ  (psN | psV | psZ)
+#define C    (psC)
 #define none 0
 
 /**
@@ -152,17 +153,20 @@ char *Branches[8] = {"BPL", "BMI", "BVC", "BVS", "BCC", "BCS", "BNE", "BEQ"};
  * This table is used by setStatus() to decide what bits to update for a given 
  * instruction, and a value of 'none' for the BIT instruction prevents setStatus()
  * from messing up the status bits as set by the BIT instruction emulation.
+ *
+ * Similarly, when the decimal flag is set ADC and SBC have their own peculiar ways
+ * of determining the PS flags, so this table casuses setStatus() to bypass these.
  */
 
 uint8_t const psBits[50] PROGMEM = {
-    NVZC /* ADC */, NZ   /* AND */, NZC  /* ASL */, none /* BCC */, none /* BIT */,
+    none /* ADC */, NZ   /* AND */, NZC  /* ASL */, none /* BCC */, none /* BIT */,
     none /* BRK */, none /* CLC */, none /* CLD */, none /* CLI */, none /* CLV */,
     NZC  /* CMP */, NZC  /* CPX */, NZC  /* CPY */, NZ   /* DEC */, NZ   /* DEX */,
     NZ   /* DEY */, NZ   /* EOR */, NZ   /* INC */, NZ   /* INX */, NZ   /* INY */,
     none /* JMP */, none /* JSR */, NZ   /* LDA */, NZ   /* LDX */, NZ   /* LDY */,
     NZC  /* LSR */, none /* NOP */, NZ   /* ORA */, none /* PHA */, none /* PHP */,
     none /* PLA */, none /* PLP */, NZC  /* ROL */, NZC  /* ROR */, none /* RTI */,
-    none /* RTS */, NVZC /* SBC */, none /* SEC */, none /* SED */, none /* SEI */,
+    none /* RTS */, none /* SBC */, none /* SEC */, none /* SED */, none /* SEI */,
     none /* STA */, none /* STX */, none /* STY */, NZ   /* TAX */, NZ   /* TAY */,
     NZ   /* TSX */, NZ   /* TXA */, none /* TXS */, NZ   /* TYA */, none /* EMT */,
 };

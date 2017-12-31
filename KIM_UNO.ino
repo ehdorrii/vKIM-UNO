@@ -42,7 +42,7 @@ unsigned long EXCLUDE_TIME;
 unsigned long EXECUTION_TIME;
 
 ///////
-// Symbolic addresses for value store in EEPROM
+// Symbolic addresses for values stored in EEPROM
 ///////
  
 #define eeaLED   0
@@ -63,9 +63,20 @@ uint16_t regMAR;        // memory address register
 uint8_t  regOP;         // current opcode
 uint8_t  regALUin;      // represents a single ALU input
 uint16_t regALUout;     // represents the ALU output
+uint8_t  regALUoutLN;   // represents the ALU output - lo nib
+uint8_t  regALUoutHN;   // represents the ALU output - hi nib
 
 // This is a helper variable for accessing tables stored in AVR PROGMEM:
 uint8_t  opIx;         // index into tables organized by opcode
+
+#define bit0 0b00000001
+#define bit1 0b00000010
+#define bit2 0b00000100
+#define bit3 0b00001000
+#define bit4 0b00010000
+#define bit5 0b00100000
+#define bit6 0b01000000
+#define bit7 0b10000000
 
 /**
  * The implementation of cycle counting is not perfect, but it's probably
@@ -73,10 +84,13 @@ uint8_t  opIx;         // index into tables organized by opcode
  */
 
 uint32_t hwCycles;      // cycles since mpuInit()
-boolean PBC = false;    // Page-boundary-crossed flag: additional clock cycle used
+uint32_t avrMicros;     // AVR clock -- used by EMT
+boolean  PBC = false;    // Page-boundary-crossed flag: additional clock cycle used
+uint8_t  HC  = 0;        // Internal half-carry flag
+uint8_t  BC  = 0;        // Internal hi-nib carry flag
 
 ///////
-// Programmer registers
+// 6502 Programmer registers
 ///////
 
 uint8_t  regA;      // accumulator
@@ -94,36 +108,11 @@ uint8_t  regPS;     // status register
 #define psZ 0x02    // zero
 #define psC 0x01    // carry
 
-///////
-// 6530 (RIOT -- RAM/ROM, I/O, and Timer) registers -- there are two of these
-///////
-
-uint8_t   riot_Data[2][2];      // Port A/B data register
-uint8_t   riot_DataDir[2][2];   // Port A/B data direction register (0=input 1=output)
-uint8_t   riot_Timer[2];        // Timer value -- reads get this value
-uint8_t   riot_TimerSet[2];     // Timer value -- writes set this value
-uint16_t  riot_TimerScale[2];   // Timer scale - can be 1, 8, 64 or 1024
-boolean   riot_TimerExpired[2]; // Timer state -- independent from IRQ state
-boolean   riot_IrqEnabled[2];   // If true, IRQ is asserted when timer rolls over to 0xFF
-boolean   riot_IrqAsserted[2];  // The state of the 6530 internal IRQ flag
-
-// These are shortcuts for referring to ports as named in the KIM-1 ROM listings
-
-#define PAD  1][0
-#define PADD 1][0
-#define PBD  1][1
-#define PBDD 1][1
-
-#define bit0 0b00000001
-#define bit1 0b00000010
-#define bit2 0b00000100
-#define bit3 0b00001000
-#define bit4 0b00010000
-#define bit5 0b00100000
-#define bit6 0b01000000
-#define bit7 0b10000000
-
-uint16_t scaleFactors[] = { 1, 8, 64, 1024};   // 6530 timer scale factors
+/**
+ * Opcode tables used by the 6502 emulation routines
+ */
+ 
+#include "OP_TABLES.h"
 
 ///////
 // Hardware lines 
@@ -200,10 +189,90 @@ uint8_t auxRAM[auxRAMsize];
  *
  *  - 0x1740..0x177F is in 6530-002 (reserved for system use). The I/O in this
  *    range is used to interface the keypad and LED display. Timer emulated.
+ *
+ *  ==Notes regarding 6530 I/O and Timer area==
+ *
+ *  A5 & A4 are not decoded. As a result, it appears as if the 
+ *  following is repeated 4 times in the memory map of a RIOT.
+ *
+ *  A3 A2 A1 A0
+ *  -- -- -- --
+ *   0  0  p  0 : Data register (I/O) - p denotes which port - 0=A 1=B
+ *   0  0  p  1 : Data Direction Register (I/O) 0=input 1=output
+ *   x  1  s  s : Read/Write timer
+ *
+ *      ss=timer scaling factor - 00=1:1  01=8:1  10=64:1  11=1024:1
+ *      x=0 disables IRQ on PB7, x=1 enables (on both read and write)
+ *
+ *  Timer counts down from the written value on each clock/scale cycle.
+ *  When the timer reaches 0, and wraps to FF, the timer "expires" and
+ *  if interrupts are enabled, then one is generated. Now the scale
+ *  factor is ignored, and the timer decrements on every clock cycle.
+ *  At the next timer read, the original timer value and scale factor
+ *  are restored, and the interrupt (if one was generated) is reset.
+ *
+ *  ==KIM-1 <-> KIM-UNO I/O Pin Mapping==
+ *  
+ *  For both 6530 and AVR, DDR: 0=input 1=output 
+ * 
+ *    6530          AVR
+ *    port  Ard'o  Port
+ *    .pin    Pin  .Bit   Usage
+ *   -----  -----  ----   ---------------------
+ *   PAD.0    D2   PD.2   segA/colA  [ 0  7   E TTY]
+ *   PAD.1    D3   PD.3   segB/colB  [ 1  8   F]
+ *   PAD.2    D4   PD.4   segC/colC  [ 2  9  AD]
+ *   PAD.3    D5   PD.5   segD/colD  [ 3  A  DA]
+ *   PAD.4    D6   PD.6   segE/colE  [ 4  B   +]
+ *   PAD.5    D7   PD.7   segF/colF  [ 5  C  GO]
+ *   PAD.6    D8   PB.0   segG/colG  [ 6  D  PC]
+ *   PAD.7    --   ----   tty/tape i/o  <==--not defined in KIM-UNO
+ *   -----    A5   PC.5   segDP [ST RS SST] <==--not defined in KIM-1
+ *   
+ *   PBD.0    --   ----   tty/tape i/o  <==--not defined in KIM-UNO 
+ *  PBD.4-1 
+ *    0000    D9   PB.1   row0 [  0   1   2   3   4   5   6  ST ]
+ *    0001   D10   PB.2   row1 [  7   8   9   A   B   C   D  RS ]
+ *    0010   D11   PB.3   row2 [  E   F  AD  DA   +  GO  PC SST ]
+ *    0011   ---   ----   row3 [TTY]    <==--not defined in KIM-UNO
+ *    0100   D12   PB.4   digit1
+ *    0101   D13   PB.5   digit2
+ *    0110    A0   PC.0   digit3
+ *    0111    A1   PC.1   digit4
+ *    1000    A2   PC.2   digit5
+ *    1001    A3   PC.3   digit6
+ *    ----    A4   PC.4   digit4.5      <==--not defined in KIM-1
+ *   PBD.5    --   ----   tty/tape i/o  <==--not defined in KIM-UNO   
+ *   PBD.6    --   ----   configured as chip-select - not usable for data
+ *   PBD.7    --   ----   tty/tape i/o  <==--not defined in KIM-UNO   
  */
 
 #define ioTimerSize   128
 #define ioTimerStart  0x1700
+
+///////
+// 6530 (RIOT -- RAM/ROM, I/O, and Timer) registers -- there are two of these
+///////
+
+uint8_t   riot_Data[2][2];      // Port A/B data register
+uint8_t   riot_DataDir[2][2];   // Port A/B data direction register (0=input 1=output)
+uint8_t   riot_Timer[2];        // Timer value -- reads get this value
+uint8_t   riot_TimerSet[2];     // Timer value -- writes set this value
+uint16_t  riot_TimerScale[2];   // Timer scale - can be 1, 8, 64 or 1024
+boolean   riot_TimerExpired[2]; // Timer state -- independent from IRQ state
+boolean   riot_IrqEnabled[2];   // If true, IRQ is asserted when timer rolls over to 0xFF
+boolean   riot_IrqAsserted[2];  // The state of the 6530 internal IRQ flag
+
+// 6530 timer scale factors
+
+uint16_t scaleFactors[] = { 1, 8, 64, 1024};   
+
+// These are shortcuts for referring to ports as named in the KIM-1 ROM listings
+
+#define PAD  1][0
+#define PADD 1][0
+#define PBD  1][1
+#define PBDD 1][1
 
 /**
  * The following ROM is specific to the KIM-1. 
@@ -211,19 +280,16 @@ uint8_t auxRAM[auxRAMsize];
 
 uint16_t const ROMsize = 2048;
 uint16_t const ROMstart = 0x1800;
+const unsigned char memROM[ROMsize] PROGMEM = {
 #include "KIM_1_ROM.h"
-
-/**
- * Opcode tables used by the 6502 emulation routines
- */
- 
-#include "OP_TABLES.h"
+};
 
 /**
  * Programs that are available to be copied to RAM at startup
  */
  
 #include "PROGS.h"
+#include "DEC_TEST.h"
 
 ////////////////////////////////
 // Debugging utility functions//
@@ -263,65 +329,6 @@ void pb8(uint8_t theValue, char* LoHi) {
  * ALL memory accesses happen via the following two functions. *
  ***************************************************************/
 
-/**
- *  Notes regarding 6530 I/O and Timer area:
- *
- *  A5 & A4 are not decoded. As a result, it appears as if the 
- *  following is repeated 4 times in the memory map of a RIOT.
- *
- *  A3 A2 A1 A0
- *  -- -- -- --
- *   0  0  p  0 : Data register (I/O) - p denotes which port - 0=A 1=B
- *   0  0  p  1 : Data Direction Register (I/O) 0=input 1=output
- *   x  1  s  s : Read/Write timer
- *
- *      ss=timer scaling factor - 00=1:1  01=8:1  10=64:1  11=1024:1
- *      x=0 disables IRQ on PB7, x=1 enables (on both read and write)
- *
- *  Timer counts down from the written value on each clock/scale cycle.
- *  When the timer reaches 0, and wraps to FF, the timer "expires" and
- *  an if interrupts are enabled, then one is generated. Now the scale
- *  factor is ignored, and the timer decrements on every clock cycle.
- *  At the next timer read, the original timer value and scale factor
- *  are restored, and the interrupt (if one was generated) is reset.
- */
-
-/**
- *  KIM-1 <-> KIM-UNO I/O Pin Mapping
- *  For both 6530 and AVR, DDR: 0=input 1=output 
- * 
- *    6530          AVR
- *    port  Ard'o  Port
- *    .pin    Pin  .Bit   Usage
- *   -----  -----  ----   ---------------------
- *   PAD.0    D2   PD.2   segA/colA  [ 0  7   E TTY]
- *   PAD.1    D3   PD.3   segB/colB  [ 1  8   F]
- *   PAD.2    D4   PD.4   segC/colC  [ 2  9  AD]
- *   PAD.3    D5   PD.5   segD/colD  [ 3  A  DA]
- *   PAD.4    D6   PD.6   segE/colE  [ 4  B   +]
- *   PAD.5    D7   PD.7   segF/colF  [ 5  C  GO]
- *   PAD.6    D8   PB.0   segG/colG  [ 6  D  PC]
- *   PAD.7    --   ----   tty/tape i/o  <==--not defined in KIM-UNO
- *   -----    A5   PC.5   segDP [ST RS SST] <==--not defined in KIM-1
- *   
- *   PBD.0    --   ----   tty/tape i/o  <==--not defined in KIM-UNO 
- *  PBD.4-1 
- *    0000    D9   PB.1   row0 [  0   1   2   3   4   5   6  ST ]
- *    0001   D10   PB.2   row1 [  7   8   9   A   B   C   D  RS ]
- *    0010   D11   PB.3   row2 [  E   F  AD  DA   +  GO  PC SST ]
- *    0011   ---   ----   row3 [TTY]    <==--not defined in KIM-UNO
- *    0100   D12   PB.4   digit1
- *    0101   D13   PB.5   digit2
- *    0110    A0   PC.0   digit3
- *    0111    A1   PC.1   digit4
- *    1000    A2   PC.2   digit5
- *    1001    A3   PC.3   digit6
- *    ----    A4   PC.4   digit4.5      <==--not defined in KIM-1
- *   PBD.5    --   ----   tty/tape i/o  <==--not defined in KIM-UNO   
- *   PBD.6    --   ----   configured as chip-select - not usable for data
- *   PBD.7    --   ----   tty/tape i/o  <==--not defined in KIM-UNO   
- */
- 
 static void memoryFetch(void) {
     uint8_t riotSelect = 0, portSelect = 0, registerSelect = 0;
 	uint8_t portb, portc, portd;
@@ -736,7 +743,7 @@ static void setStatus(void) {
 /**
  * Instructions are executed here. Instructions of special interest:
  *
- *  - ADC and SBC (special handling of PS overflow bit)
+ *  - ADC & SBC (Decimal mode is gnarly!)
  *  - BRK (increments PC by 2!)
  *  - EMT (emulator interactions)
  *
@@ -768,41 +775,53 @@ static void executeOperation(void) {
 	}
 	
     switch (pgm_read_byte_near(operation + regOP)) {
-
+        caseSBC:
+            regALUin = ~regALUin;
+            regALUin++;
         case opADC:
-            if (regPS & psD) {  // Decimal mode
-                regALUout = (regA & 0x0F) + (regALUin & 0x0F);
-                if (regPS & psC) regALUout++;
-                if (regALUout > 9) regALUout += 6;
-                regALUout += (regA & 0xF0) + (regALUin & 0xF0);
-                if (regALUout > 0x9F) regALUout += 0x60;
+            regALUoutLN = (regA & 0x0F) + (regALUin & 0x0F) + (regPS & psC);
+            regALUoutHN = (regA >> 4) + (regALUin >> 4);
 
-                /**
-                 * Since the 6502 Programming Manual says that the V flag is
-                 * only applicable for signed operations, and BCD numbers have
-                 * no sign indicator, I'm guessing that the V flag should
-                 * just be cleared -- the PM is ambiguous on this point.
-                 */
-
-                regPS &= ~psV;
-            } else {            // Binary mode
-                regALUout = regA + regALUin;
-                if (regPS & psC) regALUout++;
-
-                /**
-                 * We need to check BOTH inputs to determine oVerflow status.
-                 * One operand is lost by the time setStatus() is called,
-                 * so the V bit is set/reset here. (Only ADC & SBC affect V.)
-                 */
-
-                if (!((regA & 0x80) ^ (regALUin & 0x80))) {
-                    if ((regALUin & 0x80) != (regALUout & 0x80))
-                        regPS |= psV;
-                    else
-                        regPS &= ~psV;
-                }
+            if (regPS & psD) {
+                HC = (regALUoutLN > 9) ? 1 : 0;
+                BC = (regALUoutHN > 9) ? 1 : 0;
+            } else {             
+                HC = (regALUoutLN > 15) ? 1 : 0;
+                BC = (regALUoutHN > 15) ? 1 : 0;
             }
-            regA = regALUout;
+            
+            regALUoutLN &= 0x0F;
+            regALUoutHN &= 0x0F;
+            regALUoutHN += HC;
+            
+            // set PS flags
+            
+            regPS &= ~psZ;
+            if ((regALUoutLN | regALUoutHN) == 0) regPS |= psZ;
+            
+            regPS &= ~psN;
+            regPS |= (regALUoutHN << 4) & psN;
+
+            regPS &= ~psV;
+            if (!((regA & 0x80) ^ (regALUin & 0x80))) {
+                if ((regALUin & 0x80) != ((regALUoutHN << 4) & 0x80))
+                    regPS |= psV;
+            }
+            
+            // If decimal mode, do decimal adjust
+            
+            if (regPS & psD) {
+                if (HC) 
+                    regALUoutLN += 6;
+                if (regALUoutHN > 9)
+                    regALUoutHN += 6;
+            }
+            
+            regPS &= ~psC;
+            if (regALUoutHN & 0x10) regPS |= psC;
+
+            regA = (regALUoutLN & 0x0F) | (regALUoutHN << 4);
+
             break;
 
         case opAND:
@@ -850,7 +869,6 @@ static void executeOperation(void) {
             // The BRK instruction is documented as a 1-byte opcode,
 			// but the saved PC is incremented by 2.
             regPC++;
-            regPS |= psB;
             hwNMI = true;
             break;
 
@@ -922,8 +940,8 @@ static void executeOperation(void) {
 
         case opJSR:
             regALUout = regMAR;
-            push((uint8_t)(regPC >> 8));
-            push((uint8_t)(regPC & 0x00ff));
+            push((uint8_t)((regPC-1) >> 8));
+            push((uint8_t)((regPC-1) & 0x00ff));
             regPC = regALUout;
             break;
 
@@ -975,7 +993,7 @@ static void executeOperation(void) {
 
         case opPLP:
             regPS = pop();
-            regPS &= ~psB;
+            regPS |= psB | 0x20;
             break;
 
         case opROL:
@@ -993,61 +1011,12 @@ static void executeOperation(void) {
 
         case opRTI:
             regPS = pop();
-            regPS &= ~psB;
-            /* NOTE fall through to opRTS */
-
-        case opRTS:
+            regPS |= psB | 0x20;
             regPC = pop() + (pop() * 256);
             break;
 
-        case opSBC:
-            // For SBC, the Carry bit is used to represent borrow: if set, there
-            // was no borrow; if clear, there *was* a borrow.
-
-            if (regPS & psD) {  // Decimal mode
-                if (!(regPS & psC)) {
-                    regALUin++;
-                    if ((regALUin & 0x0F) > 0x09) regALUin += 0x06;
-                    if ((regALUin & 0xF0) > 0x90) regALUin += 0x60;
-                }
-                regALUout = (regA & 0x0F) - (regALUin & 0x0F);
-                if (regALUout > 9) { // if borrow from high digit...
-                    regALUout -= 6;
-                    regALUout &= 0x0F;
-                    regALUin += 0x10;
-                    if ((regALUin & 0xF0) > 0x90) regALUin += 0x60;
-                }
-                regALUout |= ((regA >> 4) - (regALUin >> 4)) << 4;
-                if ((regALUout >> 4) > 9) {
-                    regALUout -= 0x60;
-                    regALUout = (0x99 - regALUout) + 1;   // ??
-                }
-                regA = regALUout;
-                regALUout ^= 0x0100;
-
-                // Since the 6502 Programming Manual says that the V flag is
-                // only applicable for signed operations, and BCD numbers have
-                // no sign indicator, I'm guessing that the V flag should
-                // just be cleared -- the PM is ambiguous on this point.
-
-                regPS &= ~psV;
-            } else {              // Binary mode
-                regALUin = ~regALUin;
-                if (regPS & psC) regALUin++;
-                regALUout = regA + regALUin;
-                regA = regALUout;
-
-                // We need to check BOTH inputs to determine oVerflow status.
-                // One operand is lost by the time setStatus() is called,
-                // so the V bit is set/reset here.
-
-                if (!((regA & 0x80) ^ (regALUin & 0x80))) {
-                    if ((regALUin & 0x80) != (regALUout & 0x80))
-                        regPS |= psV;
-                    else
-                        regPS &= ~psV;
-                }
-            }
+        case opRTS:
+            regPC = pop() + (pop() * 256) + 1;
             break;
 
         case opSEC:
@@ -1112,16 +1081,16 @@ static void executeOperation(void) {
              * EMT is a mnemonic for "Emulator Trap".
              */
             switch (regMDR) {
-                case 3:  // send regA via serial
+                case 1:  // send regA via serial
                     if (regA != 0)
                         Serial.print((char) regA);
                     break;
-                case 4:  // Is a byte available on the serial interface?
+                case 2:  // is a byte available on the serial interface?
                     regPS |= psZ;          // default to "zero" - no data available
                     if (Serial.available() > 0)
                         regPS &= ~psZ;     // if data *is* available, reset "zero"
                     break;
-                case 5:  // receive regA via serial - a "blocking" call
+                case 3:  // receive regA via serial - a "blocking" call
                     pinMode(A5, OUTPUT);
                     digitalWrite(A5, LOW);
                     DDRC = 0x3f;
@@ -1134,10 +1103,42 @@ static void executeOperation(void) {
                     }
                     regA = (uint8_t) Serial.read();
                     break;
+                case 4:  // display 7 digits x 8-segments (7 + DP)
+                    break;
+                case 8:  // fetch AVR clock value into memory
+                    regMAR = regPC++;
+                    memoryFetch();
+                    regALUout = regMDR;
+                    regMAR = regPC++;
+                    memoryFetch();
+                    regMAR = (((uint16_t)regMDR) * 256) + regALUout;
+                    avrMicros = micros();
+                    for (uint8_t ix=0; ix<4; ix++) {
+                        regMDR = (uint8_t) avrMicros & 0xFF;
+                        memoryStore();
+                        regMAR++;
+                        avrMicros >>= 8;
+                    }
+                    break;
+                case 9:      // use keyboad & display
+                    kimTTY = false;
+                    break;
+                case 10:     // use serial interface
+                    kimTTY = true;
+                    break;
+                case 11:     // display digits with a gap: XXXX XX
+                    for (uint8_t ix=0; ix<4; ix++)
+                        U24_74145[ix+4] = ledGap[ix];
+                    break;
+                case 12:     // display digits without a gap: XXXXXX
+                    for (uint8_t ix=0; ix<4; ix++)
+                        U24_74145[ix+4] = ledNoGap[ix];
+                    break;
                 case 16: 
-                    // slight pause, return with Z=1; turn off digit select line.
-                    // special for Blackjack
-                    // REMOVE BEFORE DISTRIBUTION
+                    // Slight pause, return with Z=1; turn off digit select line.
+                    //                   Special for Blackjack
+                    // I consider this a cheat to patch a poorly written program.
+                    //              ** REMOVE BEFORE DISTRIBUTION **
                     for (uint8_t ix=0; ix<200; ix++) { hwCycles += PINB & 0x01; }
                     regPS |= psZ;
                     regMDR = 0;
@@ -1145,10 +1146,13 @@ static void executeOperation(void) {
                     memoryStore();
                     break;    
                 default:
+                    // Treat EMT with invalid option as an invalid opcode
+                    regPC--;
+                    hwNMI = true;
                     break;
             }
 	        break;
-        default:
+        opZZZ:  // Invalid opcodes cause trap
             hwNMI = true;
             break;
     }
@@ -1180,7 +1184,10 @@ static void pollHardware(void) {
         (pgm_read_byte_near(operation + regOP) != opRTI)) {
         push((uint8_t)(regPC >> 8));
         push((uint8_t)(regPC & 0x00ff));
-        push(regPS);
+        if (regOP == 0)          // if BRK caused this 
+            push(regPS);         // leave psB set in pushed PS reg
+        else                     // but if the source was not BRK
+            push(regPS & ~psB);  // reset the pushed psB flag
         regPS |= psI;
         regMAR = 0xfffa;
         indirection();
@@ -1362,6 +1369,7 @@ void loadProgram(uint8_t *theProgram, uint16_t theLocation, uint16_t theSize) {
     }
 }
 
+
 void setEntryPoint(uint16_t theAddress) {            
     regMDR = (byte) (theAddress & 0xFF);
     regMAR = 0x00FA;
@@ -1370,6 +1378,7 @@ void setEntryPoint(uint16_t theAddress) {
     regMDR = (byte) (theAddress >> 8);
     memoryStore();
 }
+
 
 void riotReset(uint8_t device) {
     riot_Data[device][0] = 0;
@@ -1386,7 +1395,9 @@ void riotReset(uint8_t device) {
 
 
 void mpuInit(void) {
-    regA = regX = regY = regSP = regPS = 0;
+    regA = regX = regY = 0;
+    regSP = 0xFD;
+    regPS = psB | 0x20;
     regPC = 0;
     
     hwRDY = true;
@@ -1400,7 +1411,7 @@ void mpuInit(void) {
 
 
 void mpuRun(void) {
-    char psbits[8] = "nv-bdizc";
+    char psbits[8] = "NV-BDIZC";
     char ps[9];
 
     while (hwRDY) {
@@ -1440,7 +1451,7 @@ void mpuRun(void) {
             Serial.print(F(" SP=")); px2(regSP);
             for (int ix=0; ix<8; ix++) {
                 ps[7-ix] = psbits[7-ix];
-                if (regPS & (1 << ix)) ps[7-ix] -= 0x20;
+                if (0 == (regPS & (1 << ix))) ps[7-ix] += 0x20;
             }
             ps[8] = 0;
             Serial.print(F(" PS=")); Serial.print(ps);
@@ -1529,7 +1540,7 @@ void setup(void) {
             setEntryPoint(_CLOCK_ENTRY);
             break;
         case 10:      /* 9 key */
-            loadProgram(_DEC_TEST, 0x0200, sizeof(_DEC_TEST));
+            loadProgram(_DEC_TEST_0200, 0x0200, sizeof(_DEC_TEST_0200));
             setEntryPoint(_DEC_TEST_ENTRY);
             break;
     }
