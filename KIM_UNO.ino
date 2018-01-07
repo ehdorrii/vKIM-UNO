@@ -63,8 +63,7 @@ uint16_t regMAR;        // memory address register
 uint8_t  regOP;         // current opcode
 uint8_t  regALUin;      // represents a single ALU input
 uint16_t regALUout;     // represents the ALU output
-uint8_t  regALUoutLN;   // represents the ALU output - lo nib
-uint8_t  regALUoutHN;   // represents the ALU output - hi nib
+uint8_t  regHC;         // represents ALU half-carry/half-borrow
 
 // This is a helper variable for accessing tables stored in AVR PROGMEM:
 uint8_t  opIx;         // index into tables organized by opcode
@@ -83,11 +82,11 @@ uint8_t  opIx;         // index into tables organized by opcode
  * good enough for most purposes.
  */
 
-uint32_t hwCycles;      // cycles since mpuInit()
-uint32_t avrMicros;     // AVR clock -- used by EMT
+uint32_t hwCycles;       // cycles since mpuInit()
+uint32_t avrMicros;      // AVR clock -- used by EMT
 boolean  PBC = false;    // Page-boundary-crossed flag: additional clock cycle used
-uint8_t  HC  = 0;        // Internal half-carry flag
-uint8_t  BC  = 0;        // Internal hi-nib carry flag
+uint8_t  carry;
+uint8_t  borrow;
 
 ///////
 // 6502 Programmer registers
@@ -128,8 +127,8 @@ boolean hwIRQ;      // interrupt
 ///////
 
 uint8_t U24_74145[] = {9, 10, 11, 255, 12, 13, A0, A1, A2, A3, 255, 255, 255, 255, 255, 255};  
-uint8_t ledGap[]    = {12, 13, A0, A1};
-uint8_t ledNoGap[]  = {13, A0, A1, A4};
+const uint8_t ledGap[]   PROGMEM = {12, 13, A0, A1};
+const uint8_t ledNoGap[] PROGMEM = {13, A0, A1, A4};
 
 ///////
 // KIM-1 SST switch state, and TTY jumper state
@@ -295,14 +294,14 @@ const unsigned char memROM[ROMsize] PROGMEM = {
 // Debugging utility functions//
 ////////////////////////////////
 
-char hexDigits[] = "0123456789ABCDEF";
+const char hexDigits[] PROGMEM = "0123456789ABCDEF";
 
 void px2(uint8_t theOctet) {
     char digit;
 
-    digit = hexDigits[theOctet>>4]; 
+    digit = pgm_read_byte_near(hexDigits + (theOctet>>4)); 
     Serial.print(digit);
-    digit = hexDigits[theOctet&0x0f];
+    digit = pgm_read_byte_near(hexDigits + (theOctet&0x0f));
     Serial.print(digit);
 }
 
@@ -329,10 +328,15 @@ void pb8(uint8_t theValue, char* LoHi) {
  * ALL memory accesses happen via the following two functions. *
  ***************************************************************/
 
-static void memoryFetch(void) {
-    uint8_t riotSelect = 0, portSelect = 0, registerSelect = 0;
-	uint8_t portb, portc, portd;
+// Avoid overhead of local variable creation by declaring these as global
 
+uint8_t riotSelect, portSelect, registerSelect;
+uint8_t rowSelect, thePin;
+uint8_t portb, portc, portd;
+uint8_t pinb,  pinc,  pind;
+uint8_t ddrb,  ddrc,  ddrd;
+
+static void memoryFetch(void) {
     regMAR &= 0x1fff;   /** KIM-1 does not decode the 3 MSBs of the address bus **/
 	
     if (regMAR < RAMsize)
@@ -428,10 +432,6 @@ static void memoryFetch(void) {
 
 
 static void memoryStore(void) {
-    uint8_t riotSelect = 0, portSelect = 0;
-	uint8_t rowSelect, thePin;
-	uint8_t portb, portc, portd;
-
     if (TRACE_MEMORY_ACCESS && (TRACE_ROM || (regPC < ROMstart))) {
         EXCLUDE_TIME = micros();
 		Serial.print(F("Store: ")); px4(regMAR); 
@@ -754,7 +754,6 @@ static void setStatus(void) {
 
 static void executeOperation(void) {
     boolean storeResult = false;
-    
     uint8_t theBit;
 
     if ((opIx==opSTA) || (opIx==opSTX) || (opIx==opSTY) || (opIx==opJMP) || (opIx==opJSR))
@@ -775,55 +774,23 @@ static void executeOperation(void) {
 	}
 	
     switch (pgm_read_byte_near(operation + regOP)) {
-        caseSBC:
-            regALUin = ~regALUin;
-            regALUin++;
         case opADC:
-            regALUoutLN = (regA & 0x0F) + (regALUin & 0x0F) + (regPS & psC);
-            regALUoutHN = (regA >> 4) + (regALUin >> 4);
-
+            carry = regPS & psC;
+            regALUout = regA + regALUin + carry;
+            regPS &= ~(psN | psV | psZ | psC); 
+            regPS |= ((regA ^ regALUout) & (regALUin ^ regALUout) & 0x80) ? psV : 0;
+            regPS |= (regALUout & 0x00ff) ? 0 : psZ;
+            regPS |= regALUout & psN;
             if (regPS & psD) {
-                HC = (regALUoutLN > 9) ? 1 : 0;
-                BC = (regALUoutHN > 9) ? 1 : 0;
-            } else {             
-                HC = (regALUoutLN > 15) ? 1 : 0;
-                BC = (regALUoutHN > 15) ? 1 : 0;
+                if (((regA & 0x0F) + (regALUin & 0x0F) + carry) > 9)
+                    regALUout += 6;
+                if ((regALUout & 0xF0) > 0x90)
+                    regALUout += 0x60;
             }
-            
-            regALUoutLN &= 0x0F;
-            regALUoutHN &= 0x0F;
-            regALUoutHN += HC;
-            
-            // set PS flags
-            
-            regPS &= ~psZ;
-            if ((regALUoutLN | regALUoutHN) == 0) regPS |= psZ;
-            
-            regPS &= ~psN;
-            regPS |= (regALUoutHN << 4) & psN;
-
-            regPS &= ~psV;
-            if (!((regA & 0x80) ^ (regALUin & 0x80))) {
-                if ((regALUin & 0x80) != ((regALUoutHN << 4) & 0x80))
-                    regPS |= psV;
-            }
-            
-            // If decimal mode, do decimal adjust
-            
-            if (regPS & psD) {
-                if (HC) 
-                    regALUoutLN += 6;
-                if (regALUoutHN > 9)
-                    regALUoutHN += 6;
-            }
-            
-            regPS &= ~psC;
-            if (regALUoutHN & 0x10) regPS |= psC;
-
-            regA = (regALUoutLN & 0x0F) | (regALUoutHN << 4);
-
+            regPS |= (regALUout & 0x0100) ? psC : 0;
+            regA = regALUout & 0x00ff;
             break;
-
+            
         case opAND:
             regALUout = regA & regALUin;
             regA = regALUout;
@@ -1019,6 +986,26 @@ static void executeOperation(void) {
             regPC = pop() + (pop() * 256) + 1;
             break;
 
+        case opSBC:
+            borrow = (regPS & psC) ^ psC;
+            regHC = 0;
+            regALUout = regA - regALUin - borrow;
+            regPS &= ~(psN | psV | psZ | psC); 
+            regPS |= ((regA ^ regALUout) & (regALUin ^ regALUout) & 0x80) ? psV : 0;
+            regPS |= (regALUout & 0x00ff) ? 0 : psZ;
+            regPS |= regALUout & psN;
+            if (regPS & psD) {
+                if (((regA - borrow) & 0x0F) < (regALUin & 0x0F)) {
+                    regALUout -= 0x06;
+                    regHC = 1;
+                }
+                if (((regA & 0xF0) - (regHC << 4)) < (regALUin & 0xF0))
+                    regALUout -= 0x60;
+            }
+            regPS |= (regALUout & 0x0100) ? 0 : psC;
+            regA = regALUout & 0x00ff;
+            break;
+            
         case opSEC:
             regPS |= psC;
             break;
@@ -1104,6 +1091,9 @@ static void executeOperation(void) {
                     regA = (uint8_t) Serial.read();
                     break;
                 case 4:  // display 7 digits x 8-segments (7 + DP)
+                    // A: bitmap DP->7..0<-segA
+                    // X: digit selector L->0..6<-R
+                    
                     break;
                 case 8:  // fetch AVR clock value into memory
                     regMAR = regPC++;
@@ -1128,11 +1118,11 @@ static void executeOperation(void) {
                     break;
                 case 11:     // display digits with a gap: XXXX XX
                     for (uint8_t ix=0; ix<4; ix++)
-                        U24_74145[ix+4] = ledGap[ix];
+                        U24_74145[ix+4] = pgm_read_byte_near(ledGap + ix);
                     break;
                 case 12:     // display digits without a gap: XXXXXX
                     for (uint8_t ix=0; ix<4; ix++)
-                        U24_74145[ix+4] = ledNoGap[ix];
+                        U24_74145[ix+4] = pgm_read_byte_near(ledNoGap +ix);
                     break;
                 case 16: 
                     // Slight pause, return with Z=1; turn off digit select line.
@@ -1211,9 +1201,6 @@ static void pollHardware(void) {
  */
 
 static void pollHost(void) {
-    byte pinb, pinc;
-    byte portb, portc;
-    byte ddrb,  ddrc;
 
     // Save the state of ports B and C
         
@@ -1359,11 +1346,9 @@ byte pollKey() {
  */
 
 void loadProgram(uint8_t *theProgram, uint16_t theLocation, uint16_t theSize) {
-    int index = 0;
-
     regMAR = theLocation;
-    for (index = 0; index < theSize; index++) {
-        regMDR = pgm_read_byte_near(theProgram+index);
+    for (int ix = 0; ix<theSize; ix++) {
+        regMDR = pgm_read_byte_near(theProgram + ix);
         memoryStore();
         regMAR++; 
     }
@@ -1502,14 +1487,14 @@ void setup(void) {
             break;
         case 3:      /* 2 key - display digits with a gap: XXXX XX */
             for (uint8_t ix=0; ix<4; ix++) {
-                U24_74145[ix+4] = ledGap[ix];
-                EEPROM.write(ix+eeaLED, ledGap[ix]);
+                U24_74145[ix+4] = pgm_read_byte_near(ledGap + ix);
+                EEPROM.write(ix+eeaLED, U24_74145[ix+4]);
             }
             break;
         case 4:      /* 3 key - display digits without a gap: XXXXXX */
             for (uint8_t ix=0; ix<4; ix++) {
-                U24_74145[ix+4] = ledNoGap[ix];
-                EEPROM.write(ix+eeaLED, ledNoGap[ix]);
+                U24_74145[ix+4] = pgm_read_byte_near(ledNoGap + ix);
+                EEPROM.write(ix+eeaLED, U24_74145[ix+4]);
             }
             break;
         case 5:      /* 4 key */
@@ -1540,6 +1525,10 @@ void setup(void) {
             setEntryPoint(_CLOCK_ENTRY);
             break;
         case 10:      /* 9 key */
+            loadProgram(_LUNAR_LANDER, 0x0200, sizeof(_LUNAR_LANDER));
+            setEntryPoint(_LUNAR_LANDER_ENTRY);
+            break;
+        case 11:      /* A key */
             loadProgram(_DEC_TEST_0200, 0x0200, sizeof(_DEC_TEST_0200));
             setEntryPoint(_DEC_TEST_ENTRY);
             break;

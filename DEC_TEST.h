@@ -32,7 +32,7 @@ const byte _DEC_TEST_0000[] PROGMEM = {
     /*0000*/                   //          .ORG  0
     /*0000*/                   // ERROR    .DS   1
                                //
-    /*0001*/                   // ADDSUB   .DS   1       ; ADC='A' SBC='S'
+    /*0001*/                   // ADDSUB   .DS   1       ; ADC='AA' SBC='55'
     /*0002*/                   // INC      .DS   1       ; Value of C going in
                                //
     /*0003*/                   // N1       .DS   1       ; Addend 1
@@ -46,7 +46,7 @@ const byte _DEC_TEST_0000[] PROGMEM = {
     /*000B*/                   // DNVZC    .DS   1       ; Actual PS result in decimal mode
                                //
     /*000C*/                   // BA       .DS   1       ; Binary A result
-    /*000D*/                   // BNVZC    .DS   1       ; Binary PS result
+    /*000D*/                   // BNVZC    .DS   1       ; Binary PS result (NV-BDIZC)
                                //
     /*000E*/                   // PA       .DS   1       ; Predicted accumulator result
     /*000F*/                   // PCF      .DS   1       ; Predicted carry flag result
@@ -106,7 +106,7 @@ const byte _DEC_TEST_0200[] PROGMEM = {
                                // ; binary arithmetic, the predicted accumulator result, the 
                                // ; predicted carry flag, and the predicted V flag
                                // ;
-    /*024E*/ 0xA9, 0x41,       // ADD      LDA   #'A'
+    /*024E*/ 0xA9, 0xAA,       // ADD      LDA   #0xAA
     /*0250*/ 0x85, 0x01,       //          STA   ADDSUB
                                //
     /*0252*/ 0xF8,             //          SED           ; decimal mode
@@ -165,7 +165,7 @@ const byte _DEC_TEST_0200[] PROGMEM = {
                                // ; the accumulator and flag results when N2 is subtracted from N1
                                // ; using binary arithmetic
                                // ;
-    /*0296*/ 0xA9, 0x53,       // SUB      LDA   #'S'
+    /*0296*/ 0xA9, 0x55,       // SUB      LDA   #0x55
     /*0298*/ 0x85, 0x01,       //          STA   ADDSUB
                                //
     /*029A*/ 0xF8,             //          SED           ; decimal mode
@@ -253,16 +253,16 @@ const byte _DEC_TEST_0200[] PROGMEM = {
     /*02F9*/ 0xA5, 0x0B,       //          LDA   DNVZC
     /*02FB*/ 0x45, 0x10,       //          EOR   PNF
     /*02FD*/ 0x29, 0x80,       //          AND   #$80    ; mask off N flag
-    /*02FF*/ 0xD0, 0x16,       //          BNE   C1
+    /*02FF*/ 0xD0, 0x10,       //          BNE   BYP_NVZ ;C1 was 16
     /*0301*/ 0xA5, 0x0B,       //          LDA   DNVZC
     /*0303*/ 0x45, 0x11,       //          EOR   PVF
     /*0305*/ 0x29, 0x40,       //          AND   #$40    ; mask off V flag
-    /*0307*/ 0xD0, 0x0E,       //          BNE   C1   
+    /*0307*/ 0xD0, 0x08,       //          BNE   BYP_NVZ ;C1 was 0E 
     /*0309*/ 0xA5, 0x0B,       //          LDA   DNVZC
     /*030B*/ 0x45, 0x12,       //          EOR   PZF      ; mask off Z flag
     /*030D*/ 0x29, 0x02,       //          AND   #2
-    /*030F*/ 0xD0, 0x06,       //          BNE   C1   
-    /*0311*/ 0xA5, 0x0B,       //          LDA   DNVZC
+    /*030F*/ 0xD0, 0x00,       //          BNE   BYP_NVZ ;C1 was 06
+    /*0311*/ 0xA5, 0x0B,       // BYP_NVZ  LDA   DNVZC
     /*0313*/ 0x45, 0x0F,       //          EOR   PCF
     /*0315*/ 0x29, 0x01,       //          AND   #1      ; mask off C flag
     /*0317*/ 0x60,             // C1       RTS
